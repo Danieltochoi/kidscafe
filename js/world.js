@@ -115,8 +115,56 @@ class ArcadeWorld {
     this.initTwinZiplineAndDropTarget();
     this.initBonfireHealingZone();
     this.initTagBoxes();
+    this.initClickMarker();
 
     window.addEventListener('resize', () => this.onResize());
+  }
+
+  initClickMarker() {
+    // Glowing 3D Ring + Bouncing Arrow where the user clicks!
+    this.clickMarker = new THREE.Group();
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(0.45, 0.78, 32),
+      new THREE.MeshBasicMaterial({
+        color: 0x00f5d4,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.9
+      })
+    );
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = 0.06;
+
+    const innerRing = new THREE.Mesh(
+      new THREE.RingGeometry(0.15, 0.28, 24),
+      new THREE.MeshBasicMaterial({
+        color: 0xfbbf24,
+        side: THREE.DoubleSide
+      })
+    );
+    innerRing.rotation.x = -Math.PI / 2;
+    innerRing.position.y = 0.07;
+
+    const pointer = new THREE.Mesh(
+      new THREE.ConeGeometry(0.28, 0.65, 12),
+      new THREE.MeshBasicMaterial({ color: 0x00f5d4 })
+    );
+    pointer.rotation.x = Math.PI;
+    pointer.position.y = 0.85;
+
+    this.clickMarker.add(ring, innerRing, pointer);
+    this.clickMarker.visible = false;
+    this.clickMarker.userData = { ring, pointer, timer: 0 };
+    this.scene.add(this.clickMarker);
+  }
+
+  showClickMarker(pos, colorHex = 0x00f5d4) {
+    if (!this.clickMarker) return;
+    this.clickMarker.position.set(pos.x, pos.y, pos.z);
+    this.clickMarker.userData.ring.material.color.setHex(colorHex);
+    this.clickMarker.userData.pointer.material.color.setHex(colorHex);
+    this.clickMarker.userData.timer = 2.5;
+    this.clickMarker.visible = true;
   }
 
   initLights() {
@@ -990,6 +1038,20 @@ class ArcadeWorld {
   }
 
   updateWorldElements(dt, elapsed, activeAvatarsPositions = []) {
+    // 0. Animate 3D Click Marker
+    if (this.clickMarker && this.clickMarker.visible) {
+      const s = 1.0 + Math.sin(elapsed * 8) * 0.2;
+      this.clickMarker.userData.ring.scale.set(s, s, 1);
+      this.clickMarker.userData.pointer.position.y = 0.8 + Math.abs(Math.sin(elapsed * 6)) * 0.45;
+      this.clickMarker.userData.pointer.rotation.y += dt * 4;
+      if (this.clickMarker.userData.timer > 0) {
+        this.clickMarker.userData.timer -= dt;
+        if (this.clickMarker.userData.timer <= 0) {
+          this.clickMarker.visible = false;
+        }
+      }
+    }
+
     // 1. Skywalk swaying planks
     this.skyWalkPlanks.forEach((plank) => {
       plank.position.z = plank.userData.baseZ + Math.sin(elapsed * 2.1 + plank.userData.phase) * 0.65;
