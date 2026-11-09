@@ -1,0 +1,12 @@
+{
+  "name": "arcadex-kids-metaverse",
+  "version": "1.0.0",
+  "description": "아케이드엑스 오산동탄점 3D 메타버스 키즈파크 (산사 스타일 멀티서버 실시간 웹서버 - Render 배포 지원)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

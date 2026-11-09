@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>아케이드엑스 오산동탄점 × 산사(山寺) 3D 메타버스 키즈파크</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+  <!-- 3D WebGL Canvas Container -->
+  <div id="canvas-container"></div>
+
+  <!-- Floating 3D Avatar Nameplates & Score Popups -->
+  <div id="floating-labels"></div>
+
+  <!-- Ultra-Simple Entry Modal (불멍 스타일 입장 모달) -->
+  <div id="entryOverlay" class="entry-overlay">
+    <div class="entry-card interactive">
+      <div class="entry-ember-icon">🤸🎢🧗</div>
+      <h1 class="entry-title">아케이드엑스 오산동탄점 3D</h1>
+      <p class="entry-subtitle">산사(Sansa) 멀티서버 메타버스 × 스마트 X-태그 스포츠 파크</p>
+      <div class="entry-rules">
+        <div class="rule-item"><span>⌚</span> <strong>스마트 X-태그 팔찌</strong>: 시설물 곳곳의 빛나는 [X] 박스를 터치해 점수를 올려요!</div>
+        <div class="rule-item"><span>🧗</span> <strong>어려운 놀이일수록 고득점!</strong>: 트램펄린(+30P) → 슬라이드(+80P) → 스카이워크(+150P) → 클라이밍(+250P) → 짚라인 드롭(+400P)</div>
+        <div class="rule-item"><span>🌐</span> <strong>실시간 멀티서버 전광판</strong>: 여러 서버에서 친구들과 함께 뛰고 키오스크 상품(왕관·날개)을 교환해요!</div>
+      </div>
+      <div class="entry-identity-preview">
+        <span>내 닉네임:</span>
+        <strong id="previewNickname">오산동탄챔피언</strong>
+        <button id="rerollNameBtn" class="icon-btn" title="다른 이름 뽑기">🎲</button>
+      </div>
+      <button id="enterParkBtn" class="enter-btn">🚀 키즈카페 입장하기</button>
+    </div>
+  </div>
+
+  <!-- Toast Banner -->
+  <div id="toast-banner">🎉 아케이드엑스 오산동탄점 3D 메타버스에 입장했습니다!</div>
+
+  <!-- Interactive Ride Challenge Overlay (Climbing / Zipline Drop) -->
+  <div id="ride-action-overlay">
+    <div class="challenge-title" id="challenge-title">🧗 다이내믹 클라이밍 챌린지</div>
+    <div class="challenge-sub" id="challenge-sub">버튼이나 스페이스바를 연타해 정상 황금범종을 울리세요!</div>
+    <div class="gauge-track">
+      <div class="gauge-fill" id="challenge-gauge-fill"></div>
+    </div>
+    <button class="challenge-big-btn" id="challenge-action-btn">⚡ 등반 파워업! (SPACE)</button>
+  </div>
+
+  <!-- HUD Overlay -->
+  <div id="hud">
+    <!-- Top Bar -->
+    <div class="top-bar">
+      <!-- Brand Card -->
+      <div class="brand-card interactive">
+        <div class="brand-logo">AX</div>
+        <div class="brand-info">
+          <h1>
+            아케이드엑스 오산동탄점 3D
+            <span class="badge-live">● METAVERSE LIVE</span>
+          </h1>
+          <p>실사 스포츠 파크 × 산사(山寺) 불멍·범종 힐링 어드벤처</p>
+        </div>
+      </div>
+
+      <!-- Center Score & Smart X-Tag Wristband HUD -->
+      <div class="score-center interactive">
+        <div class="wristband-icon" title="스마트 태그 팔찌">
+          <div class="wristband-ring"></div>
+          ⌚
+        </div>
+        <div class="score-details">
+          <span class="score-label">스마트 X-태그 누적 점수</span>
+          <div class="score-value-row">
+            <span class="score-value" id="hud-score">120</span>
+            <span class="score-unit">PTS</span>
+            <span class="combo-pill" id="hud-combo">🔥 1콤보 (x1배)</span>
+          </div>
+        </div>
+        <div class="level-box">
+          <span class="level-title" id="hud-level">Lv.1 키즈 탐험가</span>
+          <div class="xp-bar-bg">
+            <div class="xp-bar-fill" id="hud-xp-fill"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Top Actions -->
+      <div class="top-actions interactive">
+        <button class="hud-btn active-theme" id="btn-theme">🏯 테마: 실사+산사 융합</button>
+        <button class="hud-btn shop-btn" id="btn-shop">🎁 키오스크 상품교환소</button>
+        <button class="hud-btn" id="btn-sound">🔊 사운드 ON</button>
+      </div>
+    </div>
+
+    <!-- Middle Section: Multi-Server Status Left & Live Scoreboard Right -->
+    <div class="mid-section">
+      <!-- Left: Multi-Server Metaverse Channel & Mission Guide -->
+      <div class="side-panel interactive">
+        <div class="panel-header">
+          <span class="panel-title">🌐 메타버스 서버 채널</span>
+          <span class="total-online-pill" id="total-online-badge">전체 86명 접속중</span>
+        </div>
+        <div class="server-list" id="server-list">
+          <!-- Populated dynamically by MetaverseManager -->
+        </div>
+        <button class="hud-btn" id="copy-room-link-btn" style="width:100%; justify-content:center; margin-top:7px; font-size:11px; padding:6px 10px;">
+          🔗 현재 서버 초대링크 복사
+        </button>
+
+        <div class="mission-box">
+          <div class="mission-header">
+            <span>🎯 현재 추천 놀이 미션</span>
+            <span>어려울수록 고득점!</span>
+          </div>
+          <div class="mission-desc" id="mission-title">다이내믹 클라이밍 & 산사 범종</div>
+          <div class="mission-desc" id="mission-desc" style="font-size:11px; color:#cbd5e1; margin-top:2px;">
+            아래 놀이기구 버튼을 누르면 바로 이동해 점수를 획득할 수 있어요!
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Real-time Leaderboard & Metaverse Live Chat -->
+      <div class="side-panel right-panel interactive">
+        <div>
+          <div class="panel-header">
+            <span class="panel-title">🏆 서버 실시간 전광판 순위</span>
+          </div>
+          <div class="rank-list" id="rank-list">
+            <!-- Populated dynamically -->
+          </div>
+        </div>
+
+        <div>
+          <div class="panel-header" style="margin-bottom:5px;">
+            <span class="panel-title">💬 어린이 메타버스 라이브톡</span>
+          </div>
+          <div class="live-feed" id="live-feed"></div>
+          <div class="chat-input-row">
+            <input type="text" id="chat-input" placeholder="친구들에게 인사해보세요..." maxlength="40" />
+            <button id="chat-send-btn">전송</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bottom Bar: Touch Joystick + 1-Click Ride Selector Dock + Action Pad -->
+    <div class="bottom-bar">
+      <!-- Virtual Joystick -->
+      <div class="joystick-zone interactive" id="joystick-zone">
+        <div class="joystick-knob" id="joystick-knob"></div>
+        <div class="joystick-hint">WASD / 방향키 / 드래그</div>
+      </div>
+
+      <!-- 1-Click Quick Ride Selector (Kids can click any ride to go play immediately!) -->
+      <div class="ride-dock interactive">
+        <div class="ride-card active" data-ride="trampoline">
+          <span class="ride-diff diff-1">★ 쉬움</span>
+          <span class="ride-emoji">🤸</span>
+          <span class="ride-name">점핑 트램펄린</span>
+          <span class="ride-pts">+30~60점</span>
+        </div>
+
+        <div class="ride-card" data-ride="ballpit">
+          <span class="ride-diff diff-2">★★ 보통</span>
+          <span class="ride-emoji">🟣</span>
+          <span class="ride-name">볼풀 & 정글짐</span>
+          <span class="ride-pts">+45~75점</span>
+        </div>
+
+        <div class="ride-card" data-ride="slide">
+          <span class="ride-diff diff-3">★★★ 중급</span>
+          <span class="ride-emoji">🎢</span>
+          <span class="ride-name">다이내믹 슬라이드</span>
+          <span class="ride-pts">+80~170점</span>
+        </div>
+
+        <div class="ride-card" data-ride="skywalk">
+          <span class="ride-diff diff-4">★★★★ 어려움</span>
+          <span class="ride-emoji">🌉</span>
+          <span class="ride-name">공중 스카이워크</span>
+          <span class="ride-pts">+150~180점</span>
+        </div>
+
+        <div class="ride-card" data-ride="climbing">
+          <span class="ride-diff diff-5">★★★★★ 고난도</span>
+          <span class="ride-emoji">🧗</span>
+          <span class="ride-name">클라이밍 & 범종탑</span>
+          <span class="ride-pts">+250점</span>
+        </div>
+
+        <div class="ride-card" data-ride="zipline">
+          <span class="ride-diff diff-6">★★★★★★ 극한</span>
+          <span class="ride-emoji">🦅</span>
+          <span class="ride-name">플라잉 짚라인드롭</span>
+          <span class="ride-pts">+400점</span>
+        </div>
+
+        <div class="ride-card" data-ride="bonfire">
+          <span class="ride-diff diff-1">🔥 산사힐링</span>
+          <span class="ride-emoji">🏕️</span>
+          <span class="ride-name">불멍 힐링존</span>
+          <span class="ride-pts">+40점/힐링</span>
+        </div>
+      </div>
+
+      <!-- Right Action Buttons -->
+      <div class="action-pad interactive">
+        <button class="big-action-btn btn-tag" id="btn-tag" title="주변 [X] 박스 스마트 팔찌 태그 (E)">
+          <span class="icon">⌚</span>
+          <span class="txt">X-태그!</span>
+        </button>
+        <button class="big-action-btn btn-jump" id="btn-jump" title="점프 / 슈퍼점프 / 등반 (SPACE)">
+          <span class="icon">🚀</span>
+          <span class="txt">점프!</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Reward Kiosk Modal (상품교환소 & 아바타 꾸미기) -->
+  <div class="modal-backdrop" id="shop-modal">
+    <div class="modal-card interactive">
+      <div class="modal-header">
+        <h2>🎁 아케이드엑스 키오스크 상품 교환소</h2>
+        <button class="close-modal-btn" id="close-shop-btn">✕</button>
+      </div>
+      <p style="font-size:13px; color:#cbd5e1;">
+        어려운 놀이기구를 정복하고 모은 <strong>X-태그 점수(현재 보유: <span id="shop-my-points" style="color:#fbbf24; font-weight:900;">120 P</span>)</strong>로 멋진 메타버스 아바타 아이템을 교환하세요!
+      </p>
+      <div class="shop-grid" id="shop-grid"></div>
+    </div>
+  </div>
+
+  <script src="js/sound.js"></script>
+  <script src="js/world.js"></script>
+  <script src="js/metaverse.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>
