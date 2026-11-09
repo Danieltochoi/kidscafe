@@ -8,47 +8,53 @@ const PORT = Number(process.env.PORT) || 3010;
 // REAL-TIME ROOM & INSTANCE MANAGER (SANSA ARCHITECTURE)
 // 아케이드엑스 오산동탄점 3D 메타버스 멀티서버 엔진 (Render.com 호환)
 // ====================================================
-const MAX_PLAYERS_PER_INSTANCE = 30;
+const MAX_PLAYERS_PER_INSTANCE = 20;
 const rooms = new Map(); // key: "room:instance:region" -> RoomState
 
-const DEFAULT_ROOMS = ['server-1', 'server-2', 'server-3', 'server-4'];
+const DEFAULT_INSTANCES = [0, 1, 2, 3];
 
-function getRoomKey(room = 'server-1', instance = 0, region = 'kr') {
+function getRoomKey(room = 'arcadex', instance = 0, region = 'kr') {
   return `${room}:${instance}:${region}`;
 }
 
-function getOrCreateRoom(room = 'server-1', instance = 0, region = 'kr') {
+function getOrCreateRoom(room = 'arcadex', instance = 0, region = 'kr') {
   const key = getRoomKey(room, instance, region);
   if (!rooms.has(key)) {
     rooms.set(key, {
       room,
       instance: Number(instance) || 0,
       region,
-      theme: 'hybrid',
-      highScore: 1520,
-      highScorer: '클라이밍왕도윤',
-      clients: new Map() // clientId -> { id, res, name, score, hat, color, pos, rotY, ride, chat }
+      theme: 'arcade', // 'arcade' | 'sansa' | 'night'
+      clients: new Map() // clientId -> { id, res, name, slotIndex, ride, score, hat, color, togetherWith }
     });
   }
   return rooms.get(key);
 }
 
-// Initialize default rooms
-DEFAULT_ROOMS.forEach((r) => getOrCreateRoom(r, 0, 'kr'));
+DEFAULT_INSTANCES.forEach((inst) => getOrCreateRoom('arcadex', inst, 'kr'));
 
-function getAllServerCounts() {
-  const counts = {};
-  let totalRealClients = 0;
-  DEFAULT_ROOMS.forEach((r) => {
-    counts[r] = 0;
-  });
+function findAvailableSlotIndex(roomState) {
+  const taken = new Set();
+  for (const c of roomState.clients.values()) {
+    taken.add(c.slotIndex);
+  }
+  for (let i = 0; i < MAX_PLAYERS_PER_INSTANCE; i++) {
+    if (!taken.has(i)) return i;
+  }
+  return Math.floor(Math.random() * MAX_PLAYERS_PER_INSTANCE);
+}
+
+function getAllInstanceCounts() {
+  const instanceCounts = { 0: 0, 1: 0, 2: 0, 3: 0 };
+  let totalRealOnline = 0;
 
   for (const rState of rooms.values()) {
-    counts[rState.room] = (counts[rState.room] || 0) + rState.clients.size;
-    totalRealClients += rState.clients.size;
+    const inst = rState.instance;
+    instanceCounts[inst] = (instanceCounts[inst] || 0) + rState.clients.size;
+    totalRealOnline += rState.clients.size;
   }
 
-  return { counts, totalRealClients };
+  return { instanceCounts, totalRealOnline };
 }
 
 function getPublicRoomSnapshot(roomState) {
@@ -57,28 +63,25 @@ function getPublicRoomSnapshot(roomState) {
     users.push({
       id: c.id,
       name: c.name,
-      score: c.score || 120,
+      slotIndex: c.slotIndex,
+      ride: c.ride || 'trampoline',
+      score: c.score || 100,
       hat: c.hat || 'cap',
-      color: c.color || '#38bdf8',
-      pos: c.pos || [0, 0, 10],
-      rotY: c.rotY || 0,
-      ride: c.ride || 'free',
-      chat: c.chat || ''
+      color: c.color || '#00f5d4',
+      togetherWith: c.togetherWith || null
     });
   }
 
-  const { counts, totalRealClients } = getAllServerCounts();
+  const { instanceCounts, totalRealOnline } = getAllInstanceCounts();
 
   return {
     room: roomState.room,
     instance: roomState.instance,
     region: roomState.region,
-    theme: roomState.theme,
-    highScore: roomState.highScore,
-    highScorer: roomState.highScorer,
+    theme: roomState.theme || 'arcade',
     roomCount: roomState.clients.size,
-    totalOnline: totalRealClients,
-    serverCounts: counts,
+    totalOnline: totalRealOnline,
+    instanceCounts,
     users
   };
 }
@@ -92,8 +95,8 @@ function broadcastToRoom(roomState, eventType, payload) {
   }
 }
 
-function broadcastAllRoomsServerCounts() {
-  const summary = getAllServerCounts();
+function broadcastGlobalCounts() {
+  const summary = getAllInstanceCounts();
   const data = `event: serverCounts\ndata: ${JSON.stringify(summary)}\n\n`;
   for (const roomState of rooms.values()) {
     for (const client of roomState.clients.values()) {
@@ -104,7 +107,7 @@ function broadcastAllRoomsServerCounts() {
   }
 }
 
-// Keep-alive heartbeat every 10s (for Render.com & proxies)
+// Keep-alive heartbeat every 10s for Render.com
 setInterval(() => {
   for (const roomState of rooms.values()) {
     for (const client of roomState.clients.values()) {
@@ -115,9 +118,6 @@ setInterval(() => {
   }
 }, 10000);
 
-// ====================================================
-// HTTP + SSE REAL-TIME SERVER (ZERO EXTERNAL PACKAGES)
-// ====================================================
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -132,7 +132,6 @@ const server = http.createServer((req, res) => {
   const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = parsedUrl.pathname;
 
-  // CORS headers for Render & cross-origin access
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -143,20 +142,19 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 1. Real-time Stream Endpoint (SSE)
+  // 1. Real-time SSE Stream (/api/stream)
   if (pathname === '/api/stream' && req.method === 'GET') {
-    const room = parsedUrl.searchParams.get('room') || 'server-1';
+    const room = parsedUrl.searchParams.get('room') || 'arcadex';
     let instance = Number(parsedUrl.searchParams.get('instance') || 0);
     const region = parsedUrl.searchParams.get('region') || 'kr';
     const clientId =
       parsedUrl.searchParams.get('clientId') ||
       `kid_${Math.random().toString(36).slice(2, 9)}`;
-    const name = parsedUrl.searchParams.get('name') || '오산동탄챔피언';
-    const score = Number(parsedUrl.searchParams.get('score') || 120);
+    const name = parsedUrl.searchParams.get('name') || '신나는 번개돌이';
+    const color = parsedUrl.searchParams.get('color') || '#00f5d4';
     const hat = parsedUrl.searchParams.get('hat') || 'cap';
-    const color = parsedUrl.searchParams.get('color') || '#38bdf8';
+    const score = Number(parsedUrl.searchParams.get('score') || 100);
 
-    // Auto-scale to next instance if current instance is full (Sansa auto-sharding)
     let roomState = getOrCreateRoom(room, instance, region);
     while (
       roomState.clients.size >= MAX_PLAYERS_PER_INSTANCE &&
@@ -166,6 +164,8 @@ const server = http.createServer((req, res) => {
       instance++;
       roomState = getOrCreateRoom(room, instance, region);
     }
+
+    const slotIndex = findAvailableSlotIndex(roomState);
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
@@ -178,32 +178,33 @@ const server = http.createServer((req, res) => {
       id: clientId,
       res,
       name,
+      slotIndex,
+      ride: 'trampoline',
       score,
       hat,
       color,
-      pos: [0, 0, 10],
-      rotY: Math.PI,
-      ride: 'free',
-      chat: ''
+      togetherWith: null
     };
 
     roomState.clients.set(clientId, clientObj);
 
     const snapshot = getPublicRoomSnapshot(roomState);
-    res.write(`event: init\ndata: ${JSON.stringify({ myId: clientId, snapshot })}\n\n`);
+    res.write(
+      `event: init\ndata: ${JSON.stringify({ myId: clientId, mySlotIndex: slotIndex, snapshot })}\n\n`
+    );
 
     broadcastToRoom(roomState, 'sync', getPublicRoomSnapshot(roomState));
-    broadcastAllRoomsServerCounts();
+    broadcastGlobalCounts();
 
     req.on('close', () => {
       roomState.clients.delete(clientId);
       broadcastToRoom(roomState, 'sync', getPublicRoomSnapshot(roomState));
-      broadcastAllRoomsServerCounts();
+      broadcastGlobalCounts();
     });
     return;
   }
 
-  // 2. Real-time Player Action Endpoint (Move, Score, Tag, Chat, Bell Ring)
+  // 2. Real-time Action Endpoint (/api/action)
   if (pathname === '/api/action' && req.method === 'POST') {
     let body = '';
     req.on('data', (chunk) => {
@@ -213,55 +214,52 @@ const server = http.createServer((req, res) => {
     req.on('end', () => {
       try {
         const data = JSON.parse(body || '{}');
-        const roomState = getOrCreateRoom(data.room || 'server-1', data.instance || 0, data.region || 'kr');
+        const roomState = getOrCreateRoom(
+          data.room || 'arcadex',
+          data.instance || 0,
+          data.region || 'kr'
+        );
         const client = roomState.clients.get(data.clientId);
 
         if (client) {
-          if (data.type === 'state') {
-            if (Array.isArray(data.pos)) client.pos = data.pos;
-            if (typeof data.rotY === 'number') client.rotY = data.rotY;
-            if (typeof data.score === 'number') {
-              client.score = data.score;
-              if (data.score > roomState.highScore) {
-                roomState.highScore = data.score;
-                roomState.highScorer = client.name;
-              }
-            }
+          if (data.type === 'ride') {
+            client.ride = data.ride || 'trampoline';
+            client.togetherWith = data.togetherWith || null;
+            if (typeof data.score === 'number') client.score = data.score;
+            broadcastToRoom(roomState, 'sync', getPublicRoomSnapshot(roomState));
+            broadcastToRoom(roomState, 'effect', {
+              effect: 'startRide',
+              actorId: client.id,
+              actorName: client.name,
+              ride: client.ride,
+              together: Boolean(data.together),
+              partnerName: data.partnerName || '키즈 친구'
+            });
+          } else if (data.type === 'scoreUpdate') {
+            if (typeof data.score === 'number') client.score = data.score;
             if (data.hat) client.hat = data.hat;
             if (data.name) client.name = String(data.name).slice(0, 20);
-            if (typeof data.chat === 'string') client.chat = data.chat.slice(0, 60);
             broadcastToRoom(roomState, 'sync', getPublicRoomSnapshot(roomState));
-          } else if (data.type === 'chat' && data.text) {
-            const text = String(data.text).slice(0, 60);
-            client.chat = text;
-            broadcastToRoom(roomState, 'chat', {
-              clientId: client.id,
-              sender: client.name,
-              text
-            });
-          } else if (data.type === 'tagSuccess') {
-            client.score = Number(data.score) || client.score;
+          } else if (data.type === 'highfive') {
             broadcastToRoom(roomState, 'effect', {
-              effect: 'tagSuccess',
+              effect: 'highfive',
               actorId: client.id,
               actorName: client.name,
-              tagName: data.tagName,
-              pts: data.pts,
-              score: client.score
+              targetName: data.targetName || '친구'
             });
-          } else if (data.type === 'summitBell') {
+          } else if (data.type === 'changeTheme' && data.theme) {
+            roomState.theme = data.theme;
             broadcastToRoom(roomState, 'effect', {
-              effect: 'summitBell',
-              actorId: client.id,
-              actorName: client.name,
-              pts: data.pts || 250
+              effect: 'changeTheme',
+              theme: roomState.theme,
+              actorName: client.name
             });
           }
         }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
-      } catch (err) {
+      } catch (_) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false }));
       }
@@ -269,11 +267,11 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 3. Multi-Server Occupancy Summary API
+  // 3. Server Status & Room Counts API (/api/rooms)
   if (pathname === '/api/rooms' && req.method === 'GET') {
-    const summary = getAllServerCounts();
+    const summary = getAllInstanceCounts();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(summary));
+    res.end(JSON.stringify({ ok: true, status: 'LIVE', ...summary }));
     return;
   }
 
@@ -296,5 +294,5 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`\n🎢 [아케이드엑스 오산동탄점 3D 메타버스 서버 가동 완료]`);
-  console.log(`👉 로컬 접속 주소: http://localhost:${PORT}/?room=server-1&instance=0&region=kr\n`);
+  console.log(`👉 로컬 접속 주소: http://localhost:${PORT}/?room=arcadex&instance=0&region=kr\n`);
 });

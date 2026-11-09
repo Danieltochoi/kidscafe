@@ -1,669 +1,1059 @@
-// Main Game Loop, Ride Physics, X-Tag Scoring & Intuitive Kid Controls
+// Ultra-Smooth 1-Click Co-Op Ride Engine, Camera Controller & Real-Time Metaverse Sync
+const ADJECTIVES = ['신나는', '용감한', '해맑은', '번개같은', '날쌘', '행복한', '든든한', '반짝이는'];
+const NOUNS = ['번개돌이', '점프왕', '슬라이더', '클라이머', '탐험가', '챔피언', '다람쥐', '히어로'];
+
+function generateRandomNickname() {
+  const a = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
+  const n = NOUNS[Math.floor(Math.random() * NOUNS.length)];
+  return `${a} ${n}`;
+}
+
 class KidsCafeApp {
   constructor() {
     this.container = document.getElementById('canvas-container');
     this.world = new ArcadeWorld(this.container);
 
-    // Load saved player profile or create default
     const savedScore = parseInt(localStorage.getItem('arcadex_score') || '120', 10);
     const savedHat = localStorage.getItem('arcadex_hat') || 'cap';
-    const savedName = localStorage.getItem('arcadex_name') || '오산동탄챔피언';
+    const savedName = localStorage.getItem('arcadex_name') || generateRandomNickname();
 
-    this.player = {
+    this.state = {
       name: savedName,
       score: isNaN(savedScore) ? 120 : savedScore,
-      combo: 1,
-      comboTimer: 0,
-      level: 1,
+      combo: 1.0,
       hat: savedHat,
       unlockedHats: JSON.parse(localStorage.getItem('arcadex_unlocked') || '["cap"]'),
-      pos: new THREE.Vector3(0, 0, 10),
-      vel: new THREE.Vector3(0, 0, 0),
-      rotY: Math.PI,
-      isGrounded: true,
-      trampolineBounceCount: 0,
-      state: 'FREE', // 'FREE' | 'AUTO_WALK' | 'CLIMBING' | 'SLIDING' | 'ZIPLINE' | 'DROPPING'
-      autoTarget: null,
-      autoNextState: null,
-      climbProgress: 0,
-      slideProgress: 0,
-      zipProgress: 0,
-      bonfireHealTimer: 0,
-      chatBubble: '',
-      chatTimer: 0
+      currentRide: 'trampoline', // 'trampoline' | 'ballpit' | 'slide' | 'skywalk' | 'climbing' | 'zipline' | 'bonfire' | 'highfive'
+      rideStartTime: performance.now(),
+      rideCycleCount: 0,
+      togetherMode: true,
+      partnerName: '단짝 민준',
+      povMode: 'closeup', // 'closeup' | 'front' | 'summit' | 'wide'
+      zenMode: false
     };
 
-    // Create My 3D Kid Avatar
-    this.playerMesh = this.world.createKidAvatar({
-      shirtColor: 0x38bdf8,
-      hatType: this.player.hat,
-      bandColor: 0x00f5d4,
-      isMe: true
-    });
-    this.playerMesh.position.copy(this.player.pos);
-    this.world.scene.add(this.playerMesh);
+    // Map of all 3D character entities in the scene: id -> avatarObj
+    this.avatars = new Map();
 
-    this.myLabelEl = document.createElement('div');
-    this.myLabelEl.className = 'avatar-label';
-    document.getElementById('floating-labels').appendChild(this.myLabelEl);
+    // Smooth Camera Controller (불멍 스타일 부드러운 시점 보간)
+    this.camControl = {
+      currentPos: new THREE.Vector3(0, 10, 22),
+      currentLook: new THREE.Vector3(-16, 2, 7),
+      orbitOffset: 0,
+      pitchOffset: 0,
+      zoomOffset: 0,
+      isDragging: false,
+      dragMoved: false,
+      lastX: 0,
+      lastY: 0,
+      pinchStartDist: 0,
+      pinchStartZoom: 0
+    };
 
-    // Camera orbit parameters
-    this.camYaw = 0;
-    this.camPitch = 0.42;
-    this.camDist = 14.5;
-    this.isDraggingCam = false;
-    this.prevPointer = { x: 0, y: 0 };
+    this.raycaster = new THREE.Raycaster();
+    this.mouse = new THREE.Vector2();
 
-    // Input state
-    this.keys = {};
-    this.joyVec = { x: 0, y: 0 };
+    // Initialize Real-Time Metaverse Manager
+    this.metaverse = new MetaverseManager(this.world, (ev) => this.handleMetaverseEvent(ev));
 
-    // Initialize Multi-Server Metaverse
-    this.metaverse = new MetaverseManager(this.world, () => this.refreshHUD());
-
-    this.bindInputs();
+    this.rebuildAvatars();
     this.bindUIEvents();
-    this.refreshHUD();
+    this.bindPointerAndZoom();
+    this.updateHUD();
 
     this.lastTime = performance.now();
-    this.syncTimer = 0;
     this.animate();
   }
 
-  bindInputs() {
-    window.addEventListener('keydown', (e) => {
-      if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
-      this.keys[e.code] = true;
-      if (e.code === 'Space') {
-        e.preventDefault();
-        this.handlePrimaryAction();
+  // Build & Sync 3D Avatars (Me + Real Server Users + Friendly Kid Playmates)
+  rebuildAvatars() {
+    const activeList = [];
+
+    // 1. Always include Me first
+    activeList.push({
+      id: this.metaverse.clientId,
+      name: this.state.name,
+      score: this.state.score,
+      hat: this.state.hat,
+      color: 0x38bdf8,
+      ride: this.state.currentRide,
+      isMe: true,
+      isReal: true
+    });
+
+    // 2. Add other Real Users connected to this server instance
+    this.metaverse.realUsers.forEach((u) => {
+      if (u.id === this.metaverse.clientId) return;
+      activeList.push({
+        id: u.id,
+        name: u.name || '키즈 친구',
+        score: u.score || 120,
+        hat: u.hat || 'cap',
+        color: 0x22c55e,
+        ride: u.ride || 'trampoline',
+        isMe: false,
+        isReal: true
+      });
+    });
+
+    // 3. Add Friendly Kid Companions if enabled
+    if (this.metaverse.enableCompanions) {
+      this.metaverse.companionSpecs.forEach((comp, idx) => {
+        // First companion rides WITH you when Together Mode is ON!
+        const rideWithMe = this.state.togetherMode && idx === 0;
+        activeList.push({
+          id: comp.id,
+          name: comp.name,
+          score: comp.baseScore + Math.floor(this.state.score * 0.4),
+          hat: comp.hat,
+          color: comp.color,
+          ride: rideWithMe ? this.state.currentRide : comp.defaultRide,
+          isMe: false,
+          isReal: false,
+          isMyPartner: rideWithMe
+        });
+      });
+    }
+
+    // If there is another real player in the room and togetherMode is on, pick partner name
+    const otherReal = activeList.find((a) => !a.isMe && a.isReal);
+    if (otherReal) {
+      this.state.partnerName = otherReal.name;
+      otherReal.isMyPartner = this.state.togetherMode;
+    } else {
+      this.state.partnerName = '단짝 민준';
+    }
+
+    const activeIds = new Set();
+    const labelsRoot = document.getElementById('floating-labels');
+
+    activeList.forEach((spec, idx) => {
+      activeIds.add(spec.id);
+      let av = this.avatars.get(spec.id);
+      if (!av) {
+        const mesh = this.world.createKidAvatar({
+          id: spec.id,
+          shirtColor: spec.color,
+          hatType: spec.hat,
+          bandColor: spec.isMe ? 0x00f5d4 : 0xfbbf24,
+          isMe: spec.isMe
+        });
+        this.world.scene.add(mesh);
+
+        const labelEl = document.createElement('div');
+        labelEl.className = 'avatar-label';
+        labelsRoot.appendChild(labelEl);
+
+        av = {
+          id: spec.id,
+          mesh,
+          labelEl,
+          currentPos: new THREE.Vector3(0, 0, 10),
+          targetPos: new THREE.Vector3(0, 0, 10),
+          rotY: 0,
+          phaseOffset: idx * 1.1
+        };
+        this.avatars.set(spec.id, av);
       }
-      if (e.code === 'KeyE' || e.code === 'Enter') {
-        this.triggerNearbyTagPulse();
+
+      av.name = spec.name;
+      av.score = spec.score;
+      av.hat = spec.hat;
+      av.ride = spec.ride;
+      av.isMe = spec.isMe;
+      av.isReal = spec.isReal;
+      av.isMyPartner = Boolean(spec.isMyPartner);
+      av.mesh.userData.applyAccessory(spec.hat);
+    });
+
+    // Remove stale avatars
+    for (const [id, av] of this.avatars.entries()) {
+      if (!activeIds.has(id)) {
+        this.world.scene.remove(av.mesh);
+        if (av.labelEl) av.labelEl.remove();
+        this.avatars.delete(id);
       }
-    });
+    }
 
-    window.addEventListener('keyup', (e) => {
-      this.keys[e.code] = false;
-    });
-
-    // Camera Drag on Canvas
-    const dom = this.world.renderer.domElement;
-    dom.addEventListener('pointerdown', (e) => {
-      this.isDraggingCam = true;
-      this.prevPointer = { x: e.clientX, y: e.clientY };
-      window.soundEngine.init();
-    });
-
-    window.addEventListener('pointermove', (e) => {
-      if (!this.isDraggingCam) return;
-      const dx = e.clientX - this.prevPointer.x;
-      const dy = e.clientY - this.prevPointer.y;
-      this.prevPointer = { x: e.clientX, y: e.clientY };
-      this.camYaw -= dx * 0.0065;
-      this.camPitch = Math.max(0.15, Math.min(1.15, this.camPitch + dy * 0.005));
-    });
-
-    window.addEventListener('pointerup', () => {
-      this.isDraggingCam = false;
-    });
-
-    window.addEventListener('wheel', (e) => {
-      this.camDist = Math.max(7, Math.min(26, this.camDist + e.deltaY * 0.01));
-    });
-
-    // Virtual Touch Joystick
-    const joyZone = document.getElementById('joystick-zone');
-    const joyKnob = document.getElementById('joystick-knob');
-    let joyActive = false;
-
-    const updateJoy = (clientX, clientY) => {
-      const rect = joyZone.getBoundingClientRect();
-      const cx = rect.left + rect.width / 2;
-      const cy = rect.top + rect.height / 2;
-      let dx = clientX - cx;
-      let dy = clientY - cy;
-      const maxR = 36;
-      const dist = Math.hypot(dx, dy);
-      if (dist > maxR) {
-        dx = (dx / dist) * maxR;
-        dy = (dy / dist) * maxR;
-      }
-      joyKnob.style.transform = `translate(${dx}px, ${dy}px)`;
-      this.joyVec.x = dx / maxR;
-      this.joyVec.y = dy / maxR;
-      if (dist > 4 && this.player.state === 'AUTO_WALK') {
-        this.player.state = 'FREE';
-      }
-    };
-
-    joyZone.addEventListener('pointerdown', (e) => {
-      joyActive = true;
-      joyZone.setPointerCapture(e.pointerId);
-      updateJoy(e.clientX, e.clientY);
-    });
-
-    joyZone.addEventListener('pointermove', (e) => {
-      if (!joyActive) return;
-      updateJoy(e.clientX, e.clientY);
-    });
-
-    const resetJoy = () => {
-      joyActive = false;
-      joyKnob.style.transform = 'translate(0px, 0px)';
-      this.joyVec.x = 0;
-      this.joyVec.y = 0;
-    };
-    joyZone.addEventListener('pointerup', resetJoy);
-    joyZone.addEventListener('pointercancel', resetJoy);
+    this.updateHUD();
   }
 
-  bindUIEvents() {
-    // Entry Overlay (불멍 스타일 입장 모달)
-    const randomNames = [
-      '오산동탄챔피언',
-      '번개점퍼민준',
-      '클라이밍요정서연',
-      '스카이워커도윤',
-      '슬라이드스타하은',
-      '황금범종수호자',
-      '슈퍼짚라인지호',
-      '아케이드히어로'
-    ];
-    const previewEl = document.getElementById('previewNickname');
-    if (previewEl) previewEl.textContent = this.player.name;
-
-    const rerollBtn = document.getElementById('rerollNameBtn');
-    if (rerollBtn) {
-      rerollBtn.addEventListener('click', () => {
-        const pick = randomNames[Math.floor(Math.random() * randomNames.length)] + Math.floor(Math.random() * 90 + 10);
-        this.player.name = pick;
-        localStorage.setItem('arcadex_name', pick);
-        if (previewEl) previewEl.textContent = pick;
-        this.refreshHUD();
-      });
-    }
-
-    const enterBtn = document.getElementById('enterParkBtn');
-    if (enterBtn) {
-      enterBtn.addEventListener('click', () => {
-        window.soundEngine.init();
-        window.soundEngine.playTagSuccess(3, 2);
-        document.getElementById('entryOverlay').classList.add('hidden');
-        this.metaverse.connectServerStream(this.player);
-        this.showToast(`🎉 환영합니다, ${this.player.name}님! 원하는 놀이기구를 눌러 점수를 올려보세요!`);
-      });
-    }
-
-    const copyLinkBtn = document.getElementById('copy-room-link-btn');
-    if (copyLinkBtn) {
-      copyLinkBtn.addEventListener('click', () => {
-        const shareUrl = `${window.location.origin}${window.location.pathname}?room=${this.metaverse.currentServerId}&instance=0&region=kr`;
-        if (navigator.clipboard) {
-          navigator.clipboard.writeText(shareUrl).catch(() => {});
+  handleMetaverseEvent(ev) {
+    if (!ev) return;
+    if (ev.type === 'sync' || ev.type === 'counts' || ev.type === 'error') {
+      this.rebuildAvatars();
+    } else if (ev.type === 'effect' && ev.effect) {
+      const eff = ev.effect;
+      if (eff.actorId !== this.metaverse.clientId) {
+        if (eff.effect === 'startRide') {
+          const z = this.world.rideZones[eff.ride];
+          if (z) {
+            this.showToast(`🎢 ${eff.actorName}님이 [${z.name}] 놀이를 시작했습니다!`);
+          }
+        } else if (eff.effect === 'highfive') {
+          window.soundEngine.playTagSuccess(3, 2);
+          this.showToast(`🙌 ${eff.actorName}님이 반갑게 하이파이브를 보냅니다!`);
+        } else if (eff.effect === 'changeTheme' && eff.theme) {
+          this.applyTheme(eff.theme, false);
         }
-        this.showToast(`🔗 서버 초대 주소가 복사되었습니다! (${shareUrl})`);
-      });
+      }
     }
-
-    // Jump / Challenge Action Button
-    document.getElementById('btn-jump').addEventListener('click', () => {
-      window.soundEngine.init();
-      this.handlePrimaryAction();
-    });
-
-    // Wristband X-Tag Pulse Button
-    document.getElementById('btn-tag').addEventListener('click', () => {
-      window.soundEngine.init();
-      this.triggerNearbyTagPulse();
-    });
-
-    // Challenge Big Button (inside Climbing / Zipline modal overlay)
-    document.getElementById('challenge-action-btn').addEventListener('click', () => {
-      window.soundEngine.init();
-      this.handlePrimaryAction();
-    });
-
-    // Quick Ride Cards on Bottom Dock
-    document.querySelectorAll('.ride-card').forEach((card) => {
-      card.addEventListener('click', () => {
-        window.soundEngine.init();
-        const rideKey = card.getAttribute('data-ride');
-        this.navigateToRide(rideKey);
-
-        document.querySelectorAll('.ride-card').forEach((c) => c.classList.remove('active'));
-        card.classList.add('active');
-      });
-    });
-
-    // Theme Switcher Button (실사+산사 융합 ↔ 산사 자연힐링 ↔ 아케이드 네온)
-    document.getElementById('btn-theme').addEventListener('click', () => {
-      const mode = this.world.cycleTheme();
-      const labelMap = {
-        hybrid: '🏯 테마: 실사+산사 융합',
-        sansa: '🌲 테마: 산사(山寺) 숲속힐링',
-        arcade: '⚡ 테마: 아케이드 네온'
-      };
-      document.getElementById('btn-theme').textContent = labelMap[mode];
-      this.showToast(`${labelMap[mode]} 모드로 전환되었습니다!`);
-    });
-
-    // Sound Toggle Button
-    document.getElementById('btn-sound').addEventListener('click', () => {
-      const muted = window.soundEngine.toggleMute();
-      document.getElementById('btn-sound').textContent = muted ? '🔇 소리 켜기' : '🔊 사운드 ON';
-    });
-
-    // Reward Kiosk / Avatar Customizer Modal
-    document.getElementById('btn-shop').addEventListener('click', () => {
-      this.renderShopModal();
-      document.getElementById('shop-modal').classList.add('open');
-    });
-
-    document.getElementById('close-shop-btn').addEventListener('click', () => {
-      document.getElementById('shop-modal').classList.remove('open');
-    });
-
-    // Chat Input
-    const chatInput = document.getElementById('chat-input');
-    const sendChat = () => {
-      const txt = chatInput.value.trim();
-      if (!txt) return;
-      chatInput.value = '';
-      this.player.chatBubble = txt;
-      this.player.chatTimer = 4.5;
-      this.metaverse.broadcastChat(this.player.name, txt);
-    };
-    document.getElementById('chat-send-btn').addEventListener('click', sendChat);
-    chatInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') sendChat();
-    });
   }
 
-  // Navigate or teleport/run directly to any Ride when kid clicks a bottom Ride Card!
-  navigateToRide(rideKey) {
+  // Start a Ride (1-Click Smooth Co-Op Ride!)
+  selectRide(rideKey) {
+    window.soundEngine.init();
+
+    if (rideKey === 'highfive') {
+      this.state.currentRide = 'highfive';
+      this.state.rideStartTime = performance.now();
+      window.soundEngine.playTagSuccess(3, 2);
+      this.awardPoints(50, `🙌 ${this.state.partnerName}와 우정의 하이파이브!`, 2);
+      this.metaverse.sendAction({ type: 'highfive', targetName: this.state.partnerName });
+      this.rebuildAvatars();
+      return;
+    }
+
     const zone = this.world.rideZones[rideKey];
     if (!zone) return;
 
-    this.updateMissionGuide(zone.name, `난이도 ★×${zone.diff} | 기본 +${zone.basePts}점 미션에 도전하세요!`);
+    this.state.currentRide = rideKey;
+    this.state.rideStartTime = performance.now();
+    this.state.rideCycleCount = 0;
 
-    if (rideKey === 'slide') {
-      // Take player to Top of Mega Slide and start sliding!
-      this.player.pos.set(-16.2, 7.2, -12.2);
-      this.startSlideRide();
-      return;
-    }
+    // Reset camera orbit so it frames the new ride nicely
+    this.camControl.orbitOffset = 0;
 
-    if (rideKey === 'skywalk') {
-      // Place player at the start of the high-altitude Skywalk Bridge
-      this.player.pos.set(-10.5, 7.2, -15);
-      this.player.vel.set(0, 0, 0);
-      this.player.state = 'FREE';
-      this.hideChallengeOverlay();
-      this.showToast('🌉 다이내믹 스카이워크 출발! 흔들리는 다리를 건너 태그 박스를 터치하세요!');
-      return;
-    }
-
-    if (rideKey === 'climbing') {
-      // Place player at base of Climbing Wall and begin Climbing Challenge
-      this.player.pos.set(0, 0, -20.2);
-      this.player.rotY = Math.PI;
-      this.startClimbingChallenge();
-      return;
-    }
-
-    if (rideKey === 'zipline') {
-      // Place player at Summit Zipline Launchpad and start Zipline Flight!
-      this.startZiplineRide();
-      return;
-    }
-
-    // For ground zones (trampoline, ballpit, bonfire), smoothly run there or jump right in!
-    this.player.autoTarget = zone.pos.clone();
-    this.player.state = 'AUTO_WALK';
-    this.hideChallengeOverlay();
-    this.showToast(`🏃 [${zone.name}](으)로 이동합니다!`);
-  }
-
-  handlePrimaryAction() {
-    if (this.player.state === 'CLIMBING') {
-      // Advance climbing gauge!
-      this.player.climbProgress += 0.14;
-      window.soundEngine.playClimbStep(this.player.climbProgress);
-      this.player.pos.y = Math.min(14.5, this.player.climbProgress * 14.5);
-      this.updateChallengeGauge(this.player.climbProgress * 100);
-
-      if (this.player.climbProgress >= 1.0) {
-        this.completeClimbingSummit();
-      }
-      return;
-    }
-
-    if (this.player.state === 'ZIPLINE') {
-      // Trigger Dynamic Drop onto the Bullseye Airbag Target!
-      this.triggerZiplineDrop();
-      return;
-    }
-
-    // Standard or Trampoline Jump
-    if (this.player.isGrounded) {
-      const inTrampoline =
-        Math.abs(this.player.pos.x - -18) < 6.4 && Math.abs(this.player.pos.z - 8) < 6.4;
-
-      if (inTrampoline) {
-        this.player.trampolineBounceCount = Math.min(4, this.player.trampolineBounceCount + 1);
-        const jumpVel = 10.5 + this.player.trampolineBounceCount * 2.6;
-        this.player.vel.y = jumpVel;
-        this.player.isGrounded = false;
-        window.soundEngine.playJump(true);
-        this.showToast(`🚀 트램펄린 슈퍼 점프 x${this.player.trampolineBounceCount}!`);
-      } else {
-        this.player.vel.y = 9.2;
-        this.player.isGrounded = false;
-        window.soundEngine.playJump(false);
-      }
-    }
-  }
-
-  triggerNearbyTagPulse() {
-    // Pulse wristband light and tag any box within generous range (3.8m)
-    const band = this.playerMesh.userData.wristBand;
-    if (band) {
-      band.scale.setScalar(1.8);
-      setTimeout(() => band.scale.setScalar(1.0), 260);
-    }
-
-    let taggedAny = false;
-    this.world.tagBoxes.forEach((box) => {
-      if (box.userData.cooldown <= 0) {
-        const dist = this.player.pos.distanceTo(box.position);
-        if (dist < 4.2) {
-          this.collectTagBox(box);
-          taggedAny = true;
-        }
-      }
+    // Update active button state on bottom dock
+    document.querySelectorAll('#dockActionsContainer .action-btn').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.ride === rideKey);
     });
 
-    if (!taggedAny) {
-      // Find nearest active tag box and guide player
-      let nearest = null;
-      let minD = Infinity;
-      this.world.tagBoxes.forEach((b) => {
-        if (b.userData.cooldown <= 0) {
-          const d = this.player.pos.distanceTo(b.position);
-          if (d < minD) {
-            minD = d;
-            nearest = b;
+    if (rideKey === 'slide' || rideKey === 'zipline') {
+      window.soundEngine.playSlideWhoosh();
+    } else {
+      window.soundEngine.playJump(true);
+    }
+
+    const togetherTxt = this.state.togetherMode
+      ? `🤝 ${this.state.partnerName}와 함께 [${zone.name}] 출발! (같이 타기 보너스 2배!)`
+      : `🏃 [${zone.name}] 출발!`;
+    this.showToast(togetherTxt);
+
+    this.rebuildAvatars();
+    this.metaverse.sendAction({
+      type: 'ride',
+      ride: rideKey,
+      together: this.state.togetherMode,
+      partnerName: this.state.partnerName,
+      score: this.state.score
+    });
+  }
+
+  awardPoints(basePts, reasonText, difficulty = 1) {
+    const togetherMult = this.state.togetherMode ? 2 : 1;
+    this.state.combo = Math.min(2.5, Number((this.state.combo + 0.1).toFixed(1)));
+    const totalPts = Math.round(basePts * togetherMult * this.state.combo);
+
+    this.state.score += totalPts;
+    localStorage.setItem('arcadex_score', String(this.state.score));
+
+    const myAv = this.avatars.get(this.metaverse.clientId);
+    if (myAv) {
+      myAv.score = this.state.score;
+      this.world.spawnCelebrationBurst(
+        myAv.mesh.position.clone().add(new THREE.Vector3(0, 2.2, 0)),
+        0xfbbf24
+      );
+
+      // Floating 2D Score Popup
+      const pop = document.createElement('div');
+      pop.className = 'score-float-pop';
+      const stars = '★'.repeat(Math.min(6, difficulty));
+      pop.textContent = `${stars} ${reasonText} +${totalPts}점!`;
+
+      const screenPos = myAv.mesh.position.clone();
+      screenPos.y += 3.1;
+      screenPos.project(this.world.camera);
+      const x = (screenPos.x * 0.5 + 0.5) * window.innerWidth;
+      const y = (-(screenPos.y * 0.5) + 0.5) * window.innerHeight;
+      pop.style.left = `${x}px`;
+      pop.style.top = `${y}px`;
+      document.getElementById('floating-labels').appendChild(pop);
+      setTimeout(() => pop.remove(), 1450);
+    }
+
+    this.metaverse.sendAction({
+      type: 'scoreUpdate',
+      score: this.state.score,
+      hat: this.state.hat,
+      name: this.state.name
+    });
+
+    this.updateHUD();
+  }
+
+  // Smoothly animate every avatar on their current ride (Co-Op Side-by-Side!)
+  updateAvatarsAndRides(dt, now, elapsed) {
+    const rideElapsed = (now - this.state.rideStartTime) / 1000;
+
+    // Group avatars by ride so riders on the same ride stand/slide/climb side-by-side!
+    const rideGroups = {};
+    for (const av of this.avatars.values()) {
+      const r = av.ride || 'trampoline';
+      if (!rideGroups[r]) rideGroups[r] = [];
+      rideGroups[r].push(av);
+    }
+
+    const allPositions = [];
+
+    for (const av of this.avatars.values()) {
+      const r = av.ride || 'trampoline';
+      const groupList = rideGroups[r] || [av];
+      const slotInRide = groupList.indexOf(av);
+      // Offset side-by-side (-1.15m for Me, +1.15m for Partner!)
+      const sideOffset =
+        groupList.length === 1
+          ? 0
+          : (slotInRide - (groupList.length - 1) / 2) * 2.1;
+
+      const t = av.isMe || av.isMyPartner ? rideElapsed : elapsed + av.phaseOffset;
+
+      let targetX = 0;
+      let targetY = 0;
+      let targetZ = 0;
+      let targetRotY = 0;
+      let targetPose = {
+        torsoLean: 0,
+        leftArmX: 0,
+        rightArmX: 0,
+        leftLegX: 0,
+        rightLegX: 0,
+        bodyY: 0
+      };
+      let bubbleHTML = '';
+
+      if (r === 'trampoline') {
+        // 1. TRAMPOLINE CO-OP BOUNCING
+        const cycle = t % 4.5;
+        const bounceWave = Math.abs(Math.sin(t * 3.6));
+        const jumpHeight = bounceWave * 4.2;
+
+        targetX = -16 + sideOffset;
+        targetY = 0.72 + jumpHeight;
+        targetZ = 7 + (slotInRide > 1 ? 2.5 : 0);
+        targetRotY = 0;
+
+        if (jumpHeight > 1.2) {
+          // Arms up in the air, knees slightly tucked!
+          targetPose.leftArmX = -2.5;
+          targetPose.rightArmX = -2.5;
+          targetPose.leftLegX = 0.45;
+          targetPose.rightLegX = 0.45;
+        } else {
+          // Landing crouch
+          targetPose.torsoLean = 0.2;
+          targetPose.leftArmX = -0.5;
+          targetPose.rightArmX = -0.5;
+        }
+
+        const pct = Math.min(100, Math.floor((cycle / 4.2) * 100));
+        if (av.isMe) {
+          bubbleHTML = this.state.togetherMode
+            ? `🤸 ${this.state.partnerName}와 트램펄린 슈퍼점프! <span class="prog-bar"><span class="prog-fill" style="width:${pct}%"></span></span>`
+            : `🤸 트램펄린 점프 태그 중! (${pct}%)`;
+        } else if (av.isMyPartner) {
+          bubbleHTML = `🙌 "우와! 진짜 높이 뛴다!!"`;
+        }
+      } else if (r === 'ballpit') {
+        // 2. BALL PIT DIVING & SWIMMING
+        const cycle = t % 5.0;
+        const wadeAngle = t * 1.8 + slotInRide * 1.2;
+        targetX = 16 + Math.cos(wadeAngle) * 2.4 + sideOffset * 0.5;
+        targetZ = 7 + Math.sin(wadeAngle) * 2.2;
+        targetY = 0.35 + Math.abs(Math.sin(t * 4.5)) * 0.85;
+        targetRotY = -wadeAngle + Math.PI / 2;
+
+        const swimSwing = Math.sin(t * 8) * 0.85;
+        targetPose.torsoLean = 0.35;
+        targetPose.leftArmX = -1.2 + swimSwing;
+        targetPose.rightArmX = -1.2 - swimSwing;
+        targetPose.leftLegX = -swimSwing * 0.6;
+        targetPose.rightLegX = swimSwing * 0.6;
+
+        const pct = Math.min(100, Math.floor((cycle / 4.6) * 100));
+        if (av.isMe) {
+          bubbleHTML = `🟣 컬러 볼풀 보물찾기 다이빙! <span class="prog-bar"><span class="prog-fill" style="width:${pct}%"></span></span>`;
+        } else if (av.isMyPartner) {
+          bubbleHTML = `😆 "공이 사방으로 튀어! 재밌다!"`;
+        }
+      } else if (r === 'slide') {
+        // 3. TWIN 2-LANE MEGA SLIDE (Sitting side-by-side & racing down!)
+        const cycleDuration = 5.2;
+        const cycle = t % cycleDuration;
+        const laneX = slotInRide % 2 === 0 ? -16.6 : -14.3;
+
+        if (cycle < 1.1) {
+          // Sitting at top of Twin Slide getting ready ("3, 2, 1 출발!")
+          targetX = laneX;
+          targetY = 7.1;
+          targetZ = -11.2;
+          targetRotY = 0;
+          targetPose.torsoLean = -0.15;
+          targetPose.leftLegX = -1.35;
+          targetPose.rightLegX = -1.35;
+          targetPose.leftArmX = -2.4;
+          targetPose.rightArmX = -2.4;
+          if (av.isMe) bubbleHTML = `🎢 ${this.state.partnerName}와 나란히 출발 준비! (3, 2, 1~!)`;
+          else if (av.isMyPartner) bubbleHTML = `🙌 "누가 더 빠른지 같이 내려가자!"`;
+        } else {
+          // Sliding down the chute!
+          const slideP = Math.min(1, (cycle - 1.1) / 3.4);
+          targetX = laneX;
+          targetY = 7.1 * (1 - slideP) + 0.4 * slideP;
+          targetZ = -11.2 + slideP * 14.2;
+          targetRotY = 0;
+          targetPose.torsoLean = -0.25;
+          targetPose.leftLegX = -1.4;
+          targetPose.rightLegX = -1.4;
+          targetPose.leftArmX = -2.6;
+          targetPose.rightArmX = -2.6;
+          targetPose.bodyY = -0.25;
+
+          const pct = Math.floor(slideP * 100);
+          if (av.isMe) {
+            bubbleHTML = `🎢 트윈 슬라이드 동시 활강! ${pct}% <span class="prog-bar"><span class="prog-fill" style="width:${pct}%"></span></span>`;
+          } else if (av.isMyPartner) {
+            bubbleHTML = `🚀 "와아아아!! 바람 가르는 소리 대박!!"`;
           }
         }
-      });
-      if (nearest) {
-        this.player.autoTarget = new THREE.Vector3(nearest.position.x, 0, nearest.position.z);
-        if (nearest.position.y < 5) {
-          this.player.state = 'AUTO_WALK';
+      } else if (r === 'skywalk') {
+        // 4. DYNAMIC SKYWALK SUSPENDED BRIDGE (Crossing side-by-side!)
+        const cycleDuration = 6.0;
+        const cycle = t % cycleDuration;
+        const prog = Math.min(1, cycle / 5.2);
+
+        targetX = -9.5 + prog * 19.0;
+        targetY = 7.2 + Math.abs(Math.sin(t * 7)) * 0.18;
+        targetZ = -14 + (slotInRide % 2 === 0 ? -0.65 : 0.65);
+        targetRotY = Math.PI / 2;
+
+        // Balancing arms out & walking legs
+        const step = Math.sin(t * 9) * 0.55;
+        targetPose.torsoLean = 0.12;
+        targetPose.leftArmX = -0.9 + step * 0.3;
+        targetPose.rightArmX = -0.9 - step * 0.3;
+        targetPose.leftLegX = step;
+        targetPose.rightLegX = -step;
+
+        const pct = Math.floor(prog * 100);
+        if (av.isMe) {
+          bubbleHTML = `🌉 공중 출렁다리 건너기 ${pct}% <span class="prog-bar"><span class="prog-fill" style="width:${pct}%"></span></span>`;
+        } else if (av.isMyPartner) {
+          bubbleHTML = `🤝 "내 손 꼭 잡아! 거의 다 건넜어!"`;
         }
-        this.showToast(`⌚ 태그 팔찌 스캔! [${nearest.userData.name}] 방향으로 안내합니다!`);
-      }
-    }
-  }
+      } else if (r === 'climbing') {
+        // 5. DUAL LED CLIMBING WALL & GOLDEN BELL SUMMIT
+        const cycleDuration = 6.5;
+        const cycle = t % cycleDuration;
+        const laneX = slotInRide % 2 === 0 ? -1.4 : 1.4;
 
-  startSlideRide() {
-    this.player.state = 'SLIDING';
-    this.player.slideProgress = 0;
-    window.soundEngine.playSlideWhoosh();
-    this.showToast('🎢 다이내믹 메가 슬라이드 출발! 신나게 내려갑니다!');
-  }
+        if (cycle < 5.0) {
+          const climbP = cycle / 5.0;
+          targetX = laneX;
+          targetY = 0.5 + climbP * 14.0;
+          targetZ = -20.2;
+          targetRotY = Math.PI;
 
-  startClimbingChallenge() {
-    this.player.state = 'CLIMBING';
-    this.player.climbProgress = 0.05;
-    this.player.vel.set(0, 0, 0);
-    this.showChallengeOverlay(
-      '🧗 다이내믹 클라이밍 (난이도 ★★★★★)',
-      '스페이스바 또는 [등반 파워업!] 버튼을 연타해 산사 범종 정상까지 올라가세요!',
-      '⚡ 등반 파워업! (SPACE)'
-    );
-  }
+          // Hand-over-hand climbing motion!
+          const reach = Math.sin(t * 10);
+          targetPose.torsoLean = -0.15;
+          targetPose.leftArmX = -2.4 + reach * 0.55;
+          targetPose.rightArmX = -2.4 - reach * 0.55;
+          targetPose.leftLegX = -reach * 0.45;
+          targetPose.rightLegX = reach * 0.45;
 
-  completeClimbingSummit() {
-    this.player.state = 'FREE';
-    this.player.pos.set(0, 14.8, -21.2);
-    this.hideChallengeOverlay();
+          const pct = Math.floor(climbP * 100);
+          if (av.isMe) {
+            bubbleHTML = `🧗 듀얼 암벽 등반 중 ${pct}% <span class="prog-bar"><span class="prog-fill" style="width:${pct}%"></span></span>`;
+          } else if (av.isMyPartner) {
+            bubbleHTML = `🔥 "영차영차! 정상 황금범종이 눈앞이야!"`;
+          }
+        } else {
+          // At the Summit Pavilion celebrating & ringing the Golden Bell!
+          targetX = laneX * 0.9;
+          targetY = 14.8 + Math.abs(Math.sin(t * 8)) * 0.45;
+          targetZ = -20.5;
+          targetRotY = 0;
+          targetPose.leftArmX = -2.7;
+          targetPose.rightArmX = -2.7;
 
-    // Ring the Golden Temple Bell (산사 황금 범종 타종!)
-    window.soundEngine.playTempleBell();
-    this.world.spawnCelebrationBurst(new THREE.Vector3(0, 16.5, -21), 0xfbbf24);
-    this.awardPoints(250, '🔔 산사(山寺) 정상 황금범종 등반 완주!', 5);
+          if (av.isMe) bubbleHTML = `🔔 산사(山寺) 정상 황금범종 타종 성공!! (+250P)`;
+          else if (av.isMyPartner) bubbleHTML = `🎉 "야호!! 우리가 정상 정복했다!!"`;
+        }
+      } else if (r === 'zipline') {
+        // 6. TWIN FLYING ZIPLINE & BULLSEYE DROP
+        const cycleDuration = 6.2;
+        const cycle = t % cycleDuration;
+        const isLaneA = slotInRide % 2 === 0;
+        const startV = isLaneA ? this.world.zipStartA : this.world.zipStartB;
+        const endV = isLaneA ? this.world.zipEndA : this.world.zipEndB;
 
-    this.player.chatBubble = '산사 정상 황금범종 등반 +250점 성공!! 🔔✨';
-    this.player.chatTimer = 4.5;
-    this.metaverse.broadcastChat(this.player.name, this.player.chatBubble);
-  }
+        if (cycle < 4.4) {
+          const zipP = cycle / 4.4;
+          const curV = new THREE.Vector3().lerpVectors(startV, endV, zipP);
+          targetX = curV.x;
+          targetY = curV.y - 1.85;
+          targetZ = curV.z;
+          targetRotY = 0;
 
-  startZiplineRide() {
-    this.player.state = 'ZIPLINE';
-    this.player.zipProgress = 0;
-    this.player.pos.copy(this.world.zipStart);
-    window.soundEngine.playSlideWhoosh();
-    this.showChallengeOverlay(
-      '🦅 다이내믹 플라잉 짚라인 (최고난도 ★★★★★★)',
-      '바닥의 원형 과녁 중앙 위를 지날 때 [드롭 착지!] 버튼을 누르면 최대 +400점!',
-      '🎯 지금 다이내믹 드롭! (SPACE)'
-    );
-  }
+          // Update 3D Trolley position!
+          if (isLaneA && this.world.ziplineTrolleyA) {
+            this.world.ziplineTrolleyA.position.copy(curV);
+          } else if (!isLaneA && this.world.ziplineTrolleyB) {
+            this.world.ziplineTrolleyB.position.copy(curV);
+          }
 
-  triggerZiplineDrop() {
-    this.player.state = 'DROPPING';
-    this.hideChallengeOverlay();
-    window.soundEngine.playJump(true);
-  }
+          // Both arms raised holding the zipline handle bar!
+          targetPose.leftArmX = -2.85;
+          targetPose.rightArmX = -2.85;
+          targetPose.leftLegX = 0.35 + Math.sin(t * 6) * 0.15;
+          targetPose.rightLegX = 0.35 - Math.sin(t * 6) * 0.15;
 
-  showChallengeOverlay(title, sub, btnText) {
-    const el = document.getElementById('ride-action-overlay');
-    document.getElementById('challenge-title').textContent = title;
-    document.getElementById('challenge-sub').textContent = sub;
-    document.getElementById('challenge-action-btn').textContent = btnText;
-    this.updateChallengeGauge(0);
-    el.classList.add('visible');
-  }
+          const pct = Math.floor(zipP * 100);
+          if (av.isMe) {
+            bubbleHTML = `🦅 트윈 짚라인 동시 활강! ${pct}% <span class="prog-bar"><span class="prog-fill" style="width:${pct}%"></span></span>`;
+          } else if (av.isMyPartner) {
+            bubbleHTML = `🦅 "하늘을 나는 기분이야!! 과녁 준비~!"`;
+          }
+        } else {
+          // Dynamic Drop onto the Bullseye Airbag Target!
+          const dropP = Math.min(1, (cycle - 4.4) / 0.8);
+          targetX = isLaneA ? -1.1 : 1.1;
+          targetY = 7.0 * (1 - dropP) + 0.45 * dropP + (dropP >= 1 ? Math.abs(Math.sin(t * 10)) * 0.6 : 0);
+          targetZ = 3.0;
+          targetRotY = 0;
+          targetPose.leftArmX = -2.5;
+          targetPose.rightArmX = -2.5;
 
-  updateChallengeGauge(percent) {
-    const fill = document.getElementById('challenge-gauge-fill');
-    if (fill) fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
-  }
+          if (av.isMe) bubbleHTML = `🎯 다이내믹 드롭 과녁 정중앙 착지!! (+400P)`;
+          else if (av.isMyPartner) bubbleHTML = `👑 "골든 불스아이 동시 착지 대성공!!"`;
+        }
+      } else if (r === 'bonfire') {
+        // 7. SANSA BONFIRE HEALING ZONE (Sitting & warming hands like 불멍!)
+        const seatAng = (slotInRide / 4) * Math.PI * 2 + Math.PI / 4;
+        targetX = Math.cos(seatAng) * 3.4;
+        targetY = 0.25;
+        targetZ = 14 + Math.sin(seatAng) * 3.4;
+        targetRotY = -seatAng - Math.PI / 2;
 
-  hideChallengeOverlay() {
-    document.getElementById('ride-action-overlay').classList.remove('visible');
-  }
+        const rub = Math.sin(t * 5) * 0.12;
+        targetPose.torsoLean = 0.22;
+        targetPose.leftArmX = -1.1 + rub;
+        targetPose.rightArmX = -1.1 - rub;
+        targetPose.leftLegX = -1.25;
+        targetPose.rightLegX = -1.25;
+        targetPose.bodyY = -0.22;
 
-  collectTagBox(box) {
-    box.userData.cooldown = 7.5; // Respawns after 7.5 seconds
+        if (av.isMe) bubbleHTML = `🔥 따뜻한 산사 모닥불에 손 녹이며 힐링 중 🤲`;
+        else if (av.isMyPartner) bubbleHTML = `☺️ "불멍하니까 마음이 편해진다~"`;
+      } else if (r === 'highfive') {
+        // 8. HIGH-FIVE TOGETHER!
+        targetX = sideOffset * 0.65;
+        targetY = Math.abs(Math.sin(t * 8)) * 0.55;
+        targetZ = 9.5;
+        targetRotY = slotInRide % 2 === 0 ? 0.6 : -0.6;
+        targetPose.leftArmX = -2.5;
+        targetPose.rightArmX = -2.5;
 
-    // Increase Combo if within timer
-    if (this.player.comboTimer > 0) {
-      this.player.combo = Math.min(5, this.player.combo + 1);
-    } else {
-      this.player.combo = 1;
-    }
-    this.player.comboTimer = 14.0;
-
-    const basePts = box.userData.pts;
-    const multiplier = 1 + (this.player.combo - 1) * 0.25;
-    const finalPts = Math.round(basePts * multiplier);
-
-    window.soundEngine.playTagSuccess(box.userData.diff, this.player.combo);
-    this.world.spawnCelebrationBurst(box.position, box.userData.color);
-    this.awardPoints(finalPts, `⌚ [X-태그] ${box.userData.name}`, box.userData.diff);
-  }
-
-  awardPoints(pts, label, difficulty = 1) {
-    this.player.score += pts;
-    localStorage.setItem('arcadex_score', String(this.player.score));
-
-    // Spawn floating 3D->2D score popup
-    const pop = document.createElement('div');
-    pop.className = 'score-float-pop';
-    const stars = '★'.repeat(Math.min(6, difficulty));
-    pop.textContent = `${stars} ${label} +${pts}점!`;
-
-    const screenPos = this.player.pos.clone();
-    screenPos.y += 3.2;
-    screenPos.project(this.world.camera);
-    const x = (screenPos.x * 0.5 + 0.5) * window.innerWidth;
-    const y = (-(screenPos.y * 0.5) + 0.5) * window.innerHeight;
-    pop.style.left = `${x}px`;
-    pop.style.top = `${y}px`;
-
-    document.getElementById('floating-labels').appendChild(pop);
-    setTimeout(() => pop.remove(), 1300);
-
-    // Pop combo pill
-    const comboEl = document.getElementById('hud-combo');
-    if (comboEl) {
-      comboEl.classList.add('pop');
-      setTimeout(() => comboEl.classList.remove('pop'), 250);
-    }
-
-    this.refreshHUD();
-  }
-
-  updateMissionGuide(title, desc) {
-    const tEl = document.getElementById('mission-title');
-    const dEl = document.getElementById('mission-desc');
-    if (tEl) tEl.textContent = title;
-    if (dEl) dEl.textContent = desc;
-  }
-
-  showToast(msg) {
-    const banner = document.getElementById('toast-banner');
-    if (!banner) return;
-    banner.textContent = msg;
-    banner.classList.add('show');
-    clearTimeout(this.toastTimeout);
-    this.toastTimeout = setTimeout(() => banner.classList.remove('show'), 2800);
-  }
-
-  refreshHUD() {
-    // Score & Level calculation
-    document.getElementById('hud-score').textContent = this.player.score.toLocaleString();
-    const mult = (1 + (this.player.combo - 1) * 0.25).toFixed(2).replace(/\.00$/, '');
-    document.getElementById('hud-combo').textContent = `🔥 ${this.player.combo}콤보 (x${mult}배)`;
-
-    const level = Math.floor(this.player.score / 500) + 1;
-    const xpPercent = ((this.player.score % 500) / 500) * 100;
-    const titles = [
-      '키즈 탐험가',
-      '트램펄린 루키',
-      '슬라이드 레이서',
-      '스카이워커',
-      '산사 클라이밍 마스터',
-      '아케이드엑스 전설'
-    ];
-    const titleName = titles[Math.min(titles.length - 1, level - 1)];
-    document.getElementById('hud-level').textContent = `Lv.${level} ${titleName}`;
-    document.getElementById('hud-xp-fill').style.width = `${xpPercent}%`;
-
-    // Multi-Server List & Online Player Counts
-    const totalOnline = this.metaverse.getTotalOnlineCount();
-    document.getElementById('total-online-badge').textContent = `전체 ${totalOnline}명 접속중`;
-
-    const srvContainer = document.getElementById('server-list');
-    srvContainer.innerHTML = '';
-    this.metaverse.servers.forEach((srv) => {
-      const pop = this.metaverse.getServerPopulation(srv);
-      const ratio = pop / srv.maxPop;
-      let statusClass = 'smooth';
-      let dotClass = '';
-      let statusText = '원활';
-      if (ratio >= 0.85) {
-        statusClass = 'crowded';
-        dotClass = 'crowded';
-        statusText = '혼잡';
-      } else if (ratio >= 0.55) {
-        statusClass = 'normal';
-        dotClass = 'busy';
-        statusText = '보통';
+        if (av.isMe) bubbleHTML = `🙌 "${this.state.partnerName}야 최고야! 하이파이브!!"`;
+        else if (av.isMyPartner) bubbleHTML = `🙌 "우리 환상의 콤비네!! 짝짝!"`;
       }
 
-      const item = document.createElement('div');
-      item.className = `server-item ${srv.id === this.metaverse.currentServerId ? 'active' : ''}`;
-      item.innerHTML = `
-        <div class="server-name-wrap">
-          <span class="status-dot ${dotClass}"></span>
-          <span class="server-name">${srv.name}</span>
-        </div>
-        <div class="server-pop">
-          <span>${pop}/${srv.maxPop}명</span>
-          <span class="congestion-tag ${statusClass}">${statusText}</span>
-        </div>
-      `;
-      item.addEventListener('click', () => {
-        const switched = this.metaverse.switchServer(srv.id);
-        if (switched) {
-          this.showToast(`🌐 [${switched.name}] 서버로 이동했습니다! (현재 ${this.metaverse.getServerPopulation(switched)}명)`);
-          this.refreshHUD();
+      // Award automatic cycle completion points for Me!
+      if (av.isMe && r !== 'highfive') {
+        const cycleLenMap = {
+          trampoline: 4.5,
+          ballpit: 5.0,
+          slide: 5.2,
+          skywalk: 6.0,
+          climbing: 6.5,
+          zipline: 6.2,
+          bonfire: 5.5
+        };
+        const cLen = cycleLenMap[r] || 5.0;
+        const completedCycles = Math.floor(rideElapsed / cLen);
+        if (completedCycles > this.state.rideCycleCount) {
+          this.state.rideCycleCount = completedCycles;
+          const zone = this.world.rideZones[r];
+          if (zone) {
+            if (r === 'climbing') {
+              window.soundEngine.playTempleBell();
+            } else {
+              window.soundEngine.playTagSuccess(zone.diff, Math.floor(this.state.combo));
+            }
+            this.awardPoints(zone.basePts, `${zone.name} X-태그 성공`, zone.diff);
+          }
         }
-      });
-      srvContainer.appendChild(item);
+      }
+
+      // Smoothly interpolate position & rotation (Silky 60fps movement!)
+      av.targetPos.set(targetX, targetY, targetZ);
+      av.currentPos.lerp(av.targetPos, 0.16);
+      av.mesh.position.copy(av.currentPos);
+
+      // Smooth angle lerp
+      let diffRot = targetRotY - av.rotY;
+      while (diffRot > Math.PI) diffRot -= Math.PI * 2;
+      while (diffRot < -Math.PI) diffRot += Math.PI * 2;
+      av.rotY += diffRot * 0.16;
+      av.mesh.rotation.y = av.rotY;
+
+      // Blend articulated limbs smoothly
+      this.world.blendAvatarPose(av.mesh, targetPose, 0.18);
+
+      allPositions.push(av.currentPos);
+
+      // Project 3D Label & Action Bubble to Screen
+      this.projectAvatarOverlay(av, bubbleHTML);
+    }
+
+    return allPositions;
+  }
+
+  projectAvatarOverlay(av, bubbleHTML) {
+    const el = av.labelEl;
+    if (!el) return;
+
+    if (this.state.zenMode) {
+      el.style.opacity = '0';
+      return;
+    }
+
+    const topPos = av.mesh.position.clone();
+    topPos.y += 2.65;
+    topPos.project(this.world.camera);
+
+    if (topPos.z > 1) {
+      el.style.opacity = '0';
+      return;
+    }
+
+    const x = (topPos.x * 0.5 + 0.5) * window.innerWidth;
+    const y = (-(topPos.y * 0.5) + 0.5) * window.innerHeight;
+
+    el.style.opacity = '1';
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+
+    const actionHtml = bubbleHTML ? `<div class="char-action-bubble">${bubbleHTML}</div>` : '';
+    el.innerHTML = `
+      ${actionHtml}
+      <div class="avatar-name-tag ${av.isMe ? 'me-tag' : ''}">
+        <span>${av.isMe ? '⭐ ' : ''}${av.name}</span>
+        <span class="avatar-score-badge">${(av.score || 0).toLocaleString()}P</span>
+      </div>
+    `;
+  }
+
+  // Smooth Camera Update (4 POV Modes + Orbit & Zoom)
+  updateCamera() {
+    const myAv = this.avatars.get(this.metaverse.clientId);
+    const myPos = myAv ? myAv.currentPos : new THREE.Vector3(0, 0, 10);
+    const zone = this.world.rideZones[this.state.currentRide] || this.world.rideZones.trampoline;
+
+    let desiredLook = new THREE.Vector3(myPos.x, myPos.y + 1.4, myPos.z);
+    let baseDist = 9.5 + this.camControl.zoomOffset;
+    let baseYaw = this.camControl.orbitOffset;
+    let basePitch = 0.34 + this.camControl.pitchOffset;
+
+    if (this.state.povMode === 'closeup') {
+      // Frames both You and your Co-Op Partner clearly on the active ride!
+      desiredLook.set(myPos.x * 0.65 + zone.center.x * 0.35, myPos.y + 1.4, myPos.z);
+      baseDist = 8.8 + this.camControl.zoomOffset;
+      basePitch = 0.28 + this.camControl.pitchOffset;
+    } else if (this.state.povMode === 'front') {
+      // Close-up front view of your character
+      desiredLook.set(myPos.x, myPos.y + 1.35, myPos.z);
+      baseDist = 5.4 + this.camControl.zoomOffset;
+      baseYaw = myAv ? myAv.rotY + this.camControl.orbitOffset : 0;
+      basePitch = 0.18 + this.camControl.pitchOffset;
+    } else if (this.state.povMode === 'summit') {
+      // Views Giant Live Wall Scoreboard & Golden Bell Summit
+      desiredLook.set(0, 11.5, -21);
+      baseDist = 22 + this.camControl.zoomOffset;
+      basePitch = 0.2 + this.camControl.pitchOffset;
+    } else if (this.state.povMode === 'wide') {
+      // Wide overview of the entire 3D Kids Cafe
+      desiredLook.set(0, 3.5, -2);
+      baseDist = 32 + this.camControl.zoomOffset;
+      basePitch = 0.48 + this.camControl.pitchOffset;
+    }
+
+    baseDist = Math.max(3.8, Math.min(44, baseDist));
+    basePitch = Math.max(0.08, Math.min(1.2, basePitch));
+
+    const desiredPos = new THREE.Vector3(
+      desiredLook.x + Math.sin(baseYaw) * Math.cos(basePitch) * baseDist,
+      desiredLook.y + Math.sin(basePitch) * baseDist,
+      desiredLook.z + Math.cos(baseYaw) * Math.cos(basePitch) * baseDist
+    );
+
+    this.camControl.currentPos.lerp(desiredPos, 0.09);
+    this.camControl.currentLook.lerp(desiredLook, 0.11);
+
+    this.world.camera.position.copy(this.camControl.currentPos);
+    this.world.camera.lookAt(this.camControl.currentLook);
+  }
+
+  bindPointerAndZoom() {
+    const dom = this.world.renderer.domElement;
+
+    dom.addEventListener('pointerdown', (e) => {
+      this.camControl.isDragging = true;
+      this.camControl.dragMoved = false;
+      this.camControl.lastX = e.clientX;
+      this.camControl.lastY = e.clientY;
     });
 
-    // Live Rankings & 3D Wall Scoreboard Sync
-    const rankings = this.metaverse.getRankings(this.player);
-    const rankListEl = document.getElementById('rank-list');
-    rankListEl.innerHTML = '';
-    const medals = ['🥇', '🥈', '🥉', '4', '5'];
-    rankings.slice(0, 5).forEach((r, idx) => {
-      const row = document.createElement('div');
-      row.className = `rank-item ${r.isMe ? 'me' : ''}`;
-      row.innerHTML = `
-        <div class="rank-left">
-          <span class="rank-medal">${medals[idx] || idx + 1}</span>
-          <span>${r.name}</span>
-        </div>
-        <span class="rank-score">${r.score.toLocaleString()}점</span>
-      `;
-      rankListEl.appendChild(row);
-    });
+    window.addEventListener('pointermove', (e) => {
+      if (!this.camControl.isDragging) return;
+      const dx = e.clientX - this.camControl.lastX;
+      const dy = e.clientY - this.camControl.lastY;
+      if (Math.abs(dx) > 4 || Math.abs(dy) > 4) this.camControl.dragMoved = true;
 
-    const curSrv = this.metaverse.servers.find((s) => s.id === this.metaverse.currentServerId);
-    if (curSrv) {
-      this.world.updateWallScoreboard(
-        rankings,
-        curSrv.name,
-        this.metaverse.getServerPopulation(curSrv)
+      this.camControl.orbitOffset -= dx * 0.006;
+      this.camControl.pitchOffset = Math.max(
+        -0.25,
+        Math.min(0.75, this.camControl.pitchOffset + dy * 0.004)
       );
+      this.camControl.lastX = e.clientX;
+      this.camControl.lastY = e.clientY;
+    });
+
+    window.addEventListener('pointerup', (e) => {
+      if (!this.camControl.isDragging) return;
+      this.camControl.isDragging = false;
+      if (this.camControl.dragMoved) return;
+
+      // Raycast Click in 3D Scene: Click any 3D Ride or Friend to play together!
+      this.mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+      this.mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+      this.raycaster.setFromCamera(this.mouse, this.world.camera);
+
+      const rideHits = this.raycaster.intersectObjects(this.world.rideHitMeshes, false);
+      if (rideHits.length > 0) {
+        const rk = rideHits[0].object.userData.rideKey;
+        if (rk) {
+          this.selectRide(rk);
+          return;
+        }
+      }
+    });
+
+    window.addEventListener(
+      'wheel',
+      (e) => {
+        this.camControl.zoomOffset = Math.max(
+          -4.0,
+          Math.min(14.0, this.camControl.zoomOffset + e.deltaY * 0.006)
+        );
+      },
+      { passive: true }
+    );
+
+    // Mobile 2-finger pinch zoom
+    dom.addEventListener(
+      'touchstart',
+      (e) => {
+        if (e.touches.length === 2) {
+          this.camControl.isDragging = false;
+          const dx = e.touches[0].clientX - e.touches[1].clientX;
+          const dy = e.touches[0].clientY - e.touches[1].clientY;
+          this.camControl.pinchStartDist = Math.hypot(dx, dy);
+          this.camControl.pinchStartZoom = this.camControl.zoomOffset;
+        }
+      },
+      { passive: true }
+    );
+
+    dom.addEventListener(
+      'touchmove',
+      (e) => {
+        if (e.touches.length === 2 && this.camControl.pinchStartDist > 0) {
+          const dx = e.touches[0].clientX - e.touches[1].clientX;
+          const dy = e.touches[0].clientY - e.touches[1].clientY;
+          const dist = Math.hypot(dx, dy);
+          const delta = (this.camControl.pinchStartDist - dist) * 0.025;
+          this.camControl.zoomOffset = Math.max(
+            -4.0,
+            Math.min(14.0, this.camControl.pinchStartZoom + delta)
+          );
+        }
+      },
+      { passive: true }
+    );
+  }
+
+  bindUIEvents() {
+    // Entry Overlay
+    const previewEl = document.getElementById('previewNickname');
+    if (previewEl) previewEl.textContent = this.state.name;
+
+    document.getElementById('rerollNameBtn').addEventListener('click', () => {
+      this.state.name = generateRandomNickname();
+      localStorage.setItem('arcadex_name', this.state.name);
+      if (previewEl) previewEl.textContent = this.state.name;
+      this.rebuildAvatars();
+    });
+
+    document.getElementById('enterParkBtn').addEventListener('click', () => {
+      window.soundEngine.init();
+      window.soundEngine.playTagSuccess(3, 2);
+      document.getElementById('entryOverlay').classList.add('hidden');
+      document.getElementById('topBar').classList.remove('hidden');
+      document.getElementById('bottomDock').classList.remove('hidden');
+      this.metaverse.connectStream({
+        name: this.state.name,
+        score: this.state.score,
+        hat: this.state.hat,
+        ride: this.state.currentRide
+      });
+      this.showToast(`🎉 환영합니다, ${this.state.name}님! 하단 버튼을 눌러 친구들과 놀이기구를 타보세요!`);
+    });
+
+    // Bottom Dock 1-Click Ride Buttons
+    document.querySelectorAll('#dockActionsContainer .action-btn[data-ride]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        this.selectRide(btn.dataset.ride);
+      });
+    });
+
+    // Toggle Together Mode (같이 타기 ON/OFF)
+    document.getElementById('toggleTogetherChip').addEventListener('click', () => {
+      this.state.togetherMode = !this.state.togetherMode;
+      document.getElementById('togetherModeLabel').textContent = this.state.togetherMode
+        ? 'ON (2배 보너스!)'
+        : '혼자 타기';
+      this.rebuildAvatars();
+      this.showToast(
+        this.state.togetherMode
+          ? `🤝 친구와 같이 타기 ON! ${this.state.partnerName}와 나란히 놀이기구를 탑니다!`
+          : `🏃 혼자 타기 모드로 전환되었습니다.`
+      );
+    });
+
+    // Theme Tabs
+    document.querySelectorAll('.theme-tab').forEach((tab) => {
+      tab.addEventListener('click', () => {
+        const t = tab.dataset.theme;
+        this.applyTheme(t, true);
+        this.metaverse.sendAction({ type: 'changeTheme', theme: t });
+      });
+    });
+
+    // Camera POV Switcher
+    const povLabel = document.getElementById('povLabel');
+    document.getElementById('cameraPovBtn').addEventListener('click', () => {
+      this.camControl.orbitOffset = 0;
+      this.camControl.pitchOffset = 0;
+      this.camControl.zoomOffset = 0;
+
+      if (this.state.povMode === 'closeup') {
+        this.state.povMode = 'front';
+        povLabel.textContent = '내 캐릭터 정면';
+        this.showToast('📷 내 캐릭터 정면 보기: 내 표정과 왕관·날개·태그팔찌를 가까이서 봅니다!');
+      } else if (this.state.povMode === 'front') {
+        this.state.povMode = 'summit';
+        povLabel.textContent = '전광판 & 범종탑';
+        this.showToast('📷 실시간 3D 대형 전광판과 산사 황금범종 정상을 봅니다!');
+      } else if (this.state.povMode === 'summit') {
+        this.state.povMode = 'wide';
+        povLabel.textContent = '키즈카페 전체';
+        this.showToast('📷 키즈카페 전체 보기: 모든 놀이기구와 친구들을 한눈에 봅니다!');
+      } else {
+        this.state.povMode = 'closeup';
+        povLabel.textContent = '같이 타기 클로즈업';
+        this.showToast('📷 같이 타기 클로즈업: 친구와 함께 놀이기구 타는 모습을 생생하게 봅니다!');
+      }
+    });
+
+    // Server & Player Count Modal Open/Close
+    const toggleRoomModal = () => {
+      document.getElementById('roomModal').classList.toggle('hidden');
+      this.updateHUD();
+    };
+    document.getElementById('roomSelectBtn').addEventListener('click', toggleRoomModal);
+    document.getElementById('presencePillBtn').addEventListener('click', toggleRoomModal);
+
+    document.querySelectorAll('.close-panel-btn[data-close]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.getElementById(btn.dataset.close).classList.add('hidden');
+      });
+    });
+
+    // Instance Channel Buttons (#0, #1, #2, #3)
+    document.querySelectorAll('#instanceGroup .instance-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#instanceGroup .instance-btn').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        const inst = Number(btn.dataset.instance);
+        document.getElementById('currentInstanceTag').textContent = `#${inst}번 서버`;
+        this.metaverse.switchInstance(inst, {
+          name: this.state.name,
+          score: this.state.score,
+          hat: this.state.hat,
+          ride: this.state.currentRide
+        });
+        this.showToast(`🌐 #${inst}번 서버 채널로 이동했습니다!`);
+      });
+    });
+
+    // Companion Toggle Checkbox
+    document.getElementById('soloCompanionToggle').addEventListener('change', (e) => {
+      this.metaverse.enableCompanions = e.target.checked;
+      this.rebuildAvatars();
+    });
+
+    // Copy Room Link Button
+    document.getElementById('copyRoomLinkBtn').addEventListener('click', () => {
+      navigator.clipboard.writeText(window.location.href).catch(() => {});
+      this.showToast('🔗 현재 서버 주소가 복사되었습니다! 친구에게 보내 같은 방에서 만나세요!');
+    });
+
+    // Sound Toggle
+    document.getElementById('soundToggleBtn').addEventListener('click', () => {
+      const muted = window.soundEngine.toggleMute();
+      document.getElementById('soundToggleBtn').textContent = muted ? '🔇' : '🔊';
+      this.showToast(muted ? '🔇 소리가 꺼졌습니다.' : '🔊 소리가 켜졌습니다.');
+    });
+
+    // Zen Mode Toggle
+    document.getElementById('zenModeBtn').addEventListener('click', () => {
+      this.state.zenMode = true;
+      document.getElementById('topBar').classList.add('hidden');
+      document.getElementById('bottomDock').classList.add('hidden');
+      document.getElementById('roomModal').classList.add('hidden');
+      document.getElementById('exitZenBtn').classList.remove('hidden');
+    });
+
+    document.getElementById('exitZenBtn').addEventListener('click', () => {
+      this.state.zenMode = false;
+      document.getElementById('topBar').classList.remove('hidden');
+      document.getElementById('bottomDock').classList.remove('hidden');
+      document.getElementById('exitZenBtn').classList.add('hidden');
+    });
+
+    // Reward Kiosk Shop Modal
+    const openShop = () => {
+      this.renderShopModal();
+      document.getElementById('shop-modal').classList.add('open');
+    };
+    document.getElementById('btn-shop').addEventListener('click', openShop);
+    document.getElementById('openShopChip').addEventListener('click', openShop);
+    document.getElementById('close-shop-btn').addEventListener('click', () => {
+      document.getElementById('shop-modal').classList.remove('open');
+    });
+  }
+
+  applyTheme(mode, notify = true) {
+    this.world.setTheme(mode);
+    document.querySelectorAll('.theme-tab').forEach((b) => {
+      b.classList.toggle('active', b.dataset.theme === mode);
+    });
+    if (notify) {
+      const names = {
+        arcade: '🎪 아케이드엑스 오산동탄 실사 테마',
+        sansa: '🏯 산사(山寺) 솔숲 & 연등 힐링 테마',
+        night: '⚡ 사이버 메타버스 나이트 테마'
+      };
+      this.showToast(`${names[mode] || mode}로 변경되었습니다!`);
+    }
+  }
+
+  updateHUD() {
+    // Score & Level
+    document.getElementById('hud-score').textContent = `${this.state.score.toLocaleString()}점`;
+    document.getElementById('hud-combo').textContent = `x${this.state.combo.toFixed(1)}배`;
+
+    const lv = Math.floor(this.state.score / 400) + 1;
+    const titles = ['키즈 탐험가', '점프 루키', '슬라이드 스타', '스카이워커', '산사 범종 마스터', '아케이드 전설'];
+    document.getElementById('hud-level').textContent = `Lv.${lv} ${titles[Math.min(titles.length - 1, lv - 1)]}`;
+
+    // Real-time Server & Player Count Status
+    const realRoomCount = Math.max(1, this.metaverse.realUsers.length);
+    const totalPlaymates = this.avatars.size;
+    const totalAllServers = Math.max(realRoomCount, this.metaverse.totalRealOnline);
+
+    document.getElementById('onlineCount').textContent = String(realRoomCount);
+    document.getElementById('totalPlaymatesCount').textContent = String(totalPlaymates);
+
+    // Update Server Modal Instance Counts (#0, #1, #2, #3)
+    for (let i = 0; i < 4; i++) {
+      const popEl = document.getElementById(`instPop${i}`);
+      if (popEl) {
+        const c =
+          i === this.metaverse.instance
+            ? Math.max(1, this.metaverse.instanceCounts[i] || realRoomCount)
+            : this.metaverse.instanceCounts[i] || 0;
+        popEl.textContent = `실시간 접속 ${c}명`;
+      }
     }
 
-    // Live Chat Feed
-    const feedEl = document.getElementById('live-feed');
-    if (feedEl) {
-      feedEl.innerHTML = this.metaverse.chatMessages
-        .slice(-6)
-        .map((m) => `<div class="feed-msg"><strong>${m.sender}:</strong> ${m.text}</div>`)
-        .join('');
-      feedEl.scrollTop = feedEl.scrollHeight;
+    const healthTitle = document.getElementById('serverHealthTitle');
+    const healthSub = document.getElementById('serverHealthSub');
+    if (healthTitle && healthSub) {
+      healthTitle.textContent = this.metaverse.serverLive
+        ? '🟢 실시간 멀티서버 정상 가동 중 (LIVE)'
+        : '🟢 로컬 멀티플레이 모드 가동 중';
+      healthSub.textContent = `현재 방 접속자: ${realRoomCount}명 · 전체 서버 총 접속: ${totalAllServers}명 (단짝 친구 포함 ${totalPlaymates}명 놀이 중)`;
     }
+
+    // Populate Active Room Users List inside Server Modal
+    const usersListEl = document.getElementById('roomUsersList');
+    if (usersListEl) {
+      usersListEl.innerHTML = '';
+      for (const av of this.avatars.values()) {
+        const pill = document.createElement('span');
+        pill.className = `user-pill-tag ${av.isMe ? 'is-me' : ''}`;
+        const tag = av.isMe ? ' (나)' : av.isReal ? ' (실시간 접속)' : ' (키즈 친구)';
+        pill.textContent = `${av.name}${tag} · ${av.score}P`;
+        usersListEl.appendChild(pill);
+      }
+    }
+
+    // Update 3D Giant Wall Scoreboard
+    const rankings = Array.from(this.avatars.values())
+      .map((a) => ({ name: a.isMe ? `${a.name} (나)` : a.name, score: a.score, isMe: a.isMe }))
+      .sort((a, b) => b.score - a.score);
+
+    this.world.updateWallScoreboard(
+      rankings,
+      `#${this.metaverse.instance}번 서버`,
+      realRoomCount,
+      totalPlaymates
+    );
   }
 
   renderShopModal() {
     const items = [
       { id: 'cap', icon: '🧢', title: '아케이드 스포츠캡', desc: '기본 스포티 모자', cost: 0 },
-      { id: 'satgat', icon: '👒', title: '산사(山寺) 힐링 삿갓', desc: '산사 컨셉 전통 삿갓', cost: 200 },
-      { id: 'crown', icon: '👑', title: '황금 챔피언 왕관', desc: '오산동탄 랭커용 왕관', cost: 450 },
-      { id: 'wings', icon: '🦋', title: '사이버 네온 날개', desc: '고난도 정복자 빛의 날개', cost: 800 }
+      { id: 'satgat', icon: '👒', title: '산사(山寺) 힐링 삿갓', desc: '산사 컨셉 전통 삿갓', cost: 150 },
+      { id: 'crown', icon: '👑', title: '황금 챔피언 왕관', desc: '오산동탄 1등 황금 왕관', cost: 300 },
+      { id: 'wings', icon: '🦋', title: '사이버 네온 날개', desc: '고난도 정복자 빛의 날개', cost: 500 }
     ];
 
-    document.getElementById('shop-my-points').textContent = `${this.player.score.toLocaleString()} P`;
+    document.getElementById('shop-my-points').textContent = `${this.state.score.toLocaleString()} P`;
     const grid = document.getElementById('shop-grid');
     grid.innerHTML = '';
 
     items.forEach((it) => {
-      const unlocked = this.player.unlockedHats.includes(it.id);
-      const equipped = this.player.hat === it.id;
+      const unlocked = this.state.unlockedHats.includes(it.id);
+      const equipped = this.state.hat === it.id;
 
       const card = document.createElement('div');
       card.className = `shop-item ${equipped ? 'equipped' : ''}`;
-      let btnLabel = equipped ? '착용중 ✓' : unlocked ? '착용하기' : `${it.cost}P 교환`;
+      const btnLabel = equipped ? '착용중 ✓' : unlocked ? '착용하기' : `${it.cost}P 교환`;
 
       card.innerHTML = `
         <div class="shop-item-icon">${it.icon}</div>
@@ -673,26 +1063,25 @@ class KidsCafeApp {
       `;
 
       card.querySelector('button').addEventListener('click', () => {
-        if ( unlocked ) {
-          this.player.hat = it.id;
+        if (unlocked) {
+          this.state.hat = it.id;
           localStorage.setItem('arcadex_hat', it.id);
-          this.playerMesh.userData.applyAccessory(it.id);
+          this.rebuildAvatars();
           this.renderShopModal();
           this.showToast(`✨ [${it.title}] 아이템을 착용했습니다!`);
-        } else if (this.player.score >= it.cost) {
-          this.player.score -= it.cost;
-          this.player.unlockedHats.push(it.id);
-          this.player.hat = it.id;
-          localStorage.setItem('arcadex_score', String(this.player.score));
-          localStorage.setItem('arcadex_unlocked', JSON.stringify(this.player.unlockedHats));
+        } else if (this.state.score >= it.cost) {
+          this.state.score -= it.cost;
+          this.state.unlockedHats.push(it.id);
+          this.state.hat = it.id;
+          localStorage.setItem('arcadex_score', String(this.state.score));
+          localStorage.setItem('arcadex_unlocked', JSON.stringify(this.state.unlockedHats));
           localStorage.setItem('arcadex_hat', it.id);
-          this.playerMesh.userData.applyAccessory(it.id);
           window.soundEngine.playTagSuccess(4, 3);
+          this.rebuildAvatars();
           this.renderShopModal();
-          this.refreshHUD();
           this.showToast(`🎉 [${it.title}] 교환 및 착용 완료!`);
         } else {
-          this.showToast(`포인트가 부족합니다! (필요: ${it.cost}P) 놀이기구에서 태그 점수를 모아보세요!`);
+          this.showToast(`점수가 부족합니다! (필요: ${it.cost}P) 친구와 놀이기구를 타서 점수를 모아보세요!`);
         }
       });
 
@@ -700,271 +1089,13 @@ class KidsCafeApp {
     });
   }
 
-  getFloorHeightAt(x, z, currentY) {
-    // 1. Summit Temple Pavilion Deck (around X: -4.8..4.8, Z: -25..-18.5, Y >= 13.5)
-    if (Math.abs(x) < 4.8 && z > -25.5 && z < -18.5 && currentY >= 13.2) {
-      return 14.8;
-    }
-    // 2. Left Adventure Tower & Skywalk Bridge & Right Tower (Y = 7.2)
-    if (z > -19.2 && z < -10.8 && x > -19.5 && x < 18.5 && currentY >= 5.8) {
-      return 7.2;
-    }
-    // 3. Stairs up to Left Tower (X: -9.5 to -14.5, Z: -14.2 to -11.8)
-    if (z > -14.4 && z < -11.6 && x <= -9.0 && x >= -14.8) {
-      const ratio = (-9.0 - x) / 5.8;
-      return Math.max(0, Math.min(7.2, ratio * 7.2));
-    }
-    // 4. Jungle Gym 2nd Floor Deck above Ball Pit (X: 12.6..23.4, Z: 2.6..13.4, Y >= 3.8)
-    if (x > 12.6 && x < 23.4 && z > 2.6 && z < 13.4 && currentY >= 3.6) {
-      return 4.8;
-    }
-    // 5. Jungle Gym Ramp (X: 10.5..13.2, Z: 4.0..12.0)
-    if (x > 10.5 && x < 13.2 && z > 4.0 && z < 12.0) {
-      const r = (12.0 - z) / 8.0;
-      return Math.max(0, Math.min(4.8, r * 4.8));
-    }
-    // 6. Trampoline Bed surface
-    if (Math.abs(x - -18) < 6.5 && Math.abs(z - 8) < 6.5) {
-      return 0.72;
-    }
-    return 0;
-  }
-
-  updatePlayer(dt, elapsed) {
-    // Combo countdown
-    if (this.player.comboTimer > 0) {
-      this.player.comboTimer = Math.max(0, this.player.comboTimer - dt);
-      if (this.player.comboTimer === 0 && this.player.combo > 1) {
-        this.player.combo = 1;
-        this.refreshHUD();
-      }
-    }
-
-    if (this.player.chatTimer > 0) {
-      this.player.chatTimer -= dt;
-      if (this.player.chatTimer <= 0) this.player.chatBubble = '';
-    }
-
-    // Handle Special Ride States
-    if (this.player.state === 'SLIDING') {
-      this.player.slideProgress += dt * 0.58;
-      const t = Math.min(1, this.player.slideProgress);
-      this.player.pos.x = -16.2 + Math.sin(t * Math.PI * 4) * 0.45;
-      this.player.pos.y = 7.2 * (1 - t) + 0.4 * t;
-      this.player.pos.z = -12.0 + t * 14.5;
-      this.player.rotY = 0;
-
-      if (t >= 1) {
-        this.player.state = 'FREE';
-        this.player.vel.set(0, 6.5, 4.5);
-        this.awardPoints(80, '🎢 다이내믹 슬라이드 완주 보너스!', 3);
-      }
-    } else if (this.player.state === 'CLIMBING') {
-      // Gently decay climb progress if idle, encouraging rhythmic presses
-      this.player.pos.x = 0;
-      this.player.pos.z = -20.5;
-      this.player.rotY = Math.PI;
-      const swing = Math.sin(elapsed * 14) * 0.6;
-      this.playerMesh.userData.leftArm.rotation.x = -2.2 + swing;
-      this.playerMesh.userData.rightArm.rotation.x = -2.2 - swing;
-    } else if (this.player.state === 'ZIPLINE') {
-      this.player.zipProgress += dt * 0.28;
-      const t = this.player.zipProgress;
-      this.player.pos.lerpVectors(this.world.zipStart, this.world.zipEnd, Math.min(1, t));
-      this.player.pos.y -= 1.4; // Hang below trolley
-      this.world.ziplineTrolley.position.lerpVectors(
-        this.world.zipStart,
-        this.world.zipEnd,
-        Math.min(1, t)
-      );
-      this.player.rotY = 0;
-
-      // Gauge shows how close we are to the Bullseye Target at Z = 2.0 (around t = 0.91)
-      const accuracy = Math.max(0, 1 - Math.abs(t - 0.91) * 3.5);
-      this.updateChallengeGauge(accuracy * 100);
-
-      if (t >= 1.0) {
-        this.triggerZiplineDrop();
-      }
-    } else if (this.player.state === 'DROPPING') {
-      this.player.pos.y -= 18 * dt;
-      if (this.player.pos.y <= 0.4) {
-        this.player.pos.y = 0.4;
-        this.player.state = 'FREE';
-        this.world.ziplineTrolley.position.copy(this.world.zipStart);
-
-        // Calculate distance to Bullseye Center (0, 0, 2.0)
-        const dist = Math.hypot(this.player.pos.x - 0, this.player.pos.z - 2.0);
-        let dropPts = 150;
-        let msg = '🎯 다이내믹 드롭 착지 성공!';
-        if (dist < 2.2) {
-          dropPts = 400;
-          msg = '👑 다이내믹 드롭 골든 불스아이 정중앙 명중!!';
-        } else if (dist < 4.5) {
-          dropPts = 280;
-          msg = '🔥 다이내믹 드롭 고득점 과녁 명중!';
-        }
-        window.soundEngine.playTagSuccess(6, 4);
-        this.world.spawnCelebrationBurst(this.player.pos.clone(), 0xff2a85);
-        this.awardPoints(dropPts, msg, 6);
-      }
-    } else {
-      // FREE or AUTO_WALK Movement
-      let moveX = this.joyVec.x;
-      let moveZ = this.joyVec.y;
-
-      if (this.keys['KeyW'] || this.keys['ArrowUp']) moveZ -= 1;
-      if (this.keys['KeyS'] || this.keys['ArrowDown']) moveZ += 1;
-      if (this.keys['KeyA'] || this.keys['ArrowLeft']) moveX -= 1;
-      if (this.keys['KeyD'] || this.keys['ArrowRight']) moveX += 1;
-
-      if (Math.abs(moveX) > 0.05 || Math.abs(moveZ) > 0.05) {
-        this.player.state = 'FREE';
-      }
-
-      if (this.player.state === 'AUTO_WALK' && this.player.autoTarget) {
-        const dx = this.player.autoTarget.x - this.player.pos.x;
-        const dz = this.player.autoTarget.z - this.player.pos.z;
-        const dist = Math.hypot(dx, dz);
-        if (dist < 1.1) {
-          this.player.state = 'FREE';
-          this.player.autoTarget = null;
-        } else {
-          moveX = dx / dist;
-          moveZ = dz / dist;
-        }
-      }
-
-      const moveLen = Math.hypot(moveX, moveZ);
-      const speed = 9.6;
-
-      if (moveLen > 0.05) {
-        const nx = moveX / Math.max(1, moveLen);
-        const nz = moveZ / Math.max(1, moveLen);
-
-        // Rotate movement by camera yaw if manual input
-        let worldMoveX = nx;
-        let worldMoveZ = nz;
-        if (this.player.state !== 'AUTO_WALK') {
-          const cos = Math.cos(this.camYaw);
-          const sin = Math.sin(this.camYaw);
-          worldMoveX = nx * cos + nz * sin;
-          worldMoveZ = -nx * sin + nz * cos;
-        }
-
-        this.player.pos.x += worldMoveX * speed * dt;
-        this.player.pos.z += worldMoveZ * speed * dt;
-        this.player.rotY = Math.atan2(worldMoveX, worldMoveZ);
-
-        // Limb running swing
-        const swing = Math.sin(elapsed * 13) * 0.65;
-        this.playerMesh.userData.leftLeg.rotation.x = swing;
-        this.playerMesh.userData.rightLeg.rotation.x = -swing;
-        this.playerMesh.userData.leftArm.rotation.x = -swing;
-        this.playerMesh.userData.rightArm.rotation.x = swing;
-      } else {
-        this.playerMesh.userData.leftLeg.rotation.x *= 0.85;
-        this.playerMesh.userData.rightLeg.rotation.x *= 0.85;
-        this.playerMesh.userData.leftArm.rotation.x *= 0.85;
-        this.playerMesh.userData.rightArm.rotation.x *= 0.85;
-      }
-
-      // Gravity & Floor/Platform Collision
-      const floorY = this.getFloorHeightAt(
-        this.player.pos.x,
-        this.player.pos.z,
-        this.player.pos.y
-      );
-      this.player.vel.y -= 22.0 * dt;
-      this.player.pos.y += this.player.vel.y * dt;
-
-      if (this.player.pos.y <= floorY) {
-        this.player.pos.y = floorY;
-        this.player.vel.y = 0;
-        this.player.isGrounded = true;
-
-        // Auto-bounce when on Trampoline Zone!
-        if (Math.abs(this.player.pos.x - -18) < 6.2 && Math.abs(this.player.pos.z - 8) < 6.2) {
-          this.player.vel.y = 8.8;
-          this.player.isGrounded = false;
-        } else {
-          this.player.trampolineBounceCount = 0;
-        }
-      }
-
-      // Auto-trigger Slide if walking onto slide entry at (-16.2, 7.2, -11.5)
-      if (
-        this.player.pos.y > 6.5 &&
-        Math.abs(this.player.pos.x - -16.2) < 1.6 &&
-        Math.abs(this.player.pos.z - -11.8) < 1.6
-      ) {
-        this.startSlideRide();
-      }
-
-      // Auto-prompt Climbing if walking right up to the Climbing Wall base
-      if (
-        this.player.pos.y < 2.0 &&
-        Math.abs(this.player.pos.x) < 3.2 &&
-        Math.abs(this.player.pos.z - -20.5) < 1.4
-      ) {
-        this.startClimbingChallenge();
-      }
-
-      // Bonfire ("불멍") Cozy Healing Bonus when relaxing near the fire pit (0, 0, 15)
-      const distToFire = Math.hypot(this.player.pos.x - 0, this.player.pos.z - 15);
-      if (distToFire < 4.5) {
-        this.player.bonfireHealTimer += dt;
-        if (this.player.bonfireHealTimer >= 4.0) {
-          this.player.bonfireHealTimer = 0;
-          this.awardPoints(40, '🔥 산사 불멍 힐링 에너지 충전', 1);
-        }
-      } else {
-        this.player.bonfireHealTimer = 0;
-      }
-
-      // Clamp inside park bounds
-      this.player.pos.x = Math.max(-34, Math.min(34, this.player.pos.x));
-      this.player.pos.z = Math.max(-29, Math.min(29, this.player.pos.z));
-    }
-
-    // Check Automatic X-Tag Box Collisions
-    this.world.tagBoxes.forEach((box) => {
-      if (box.userData.cooldown <= 0) {
-        const dist = this.player.pos.distanceTo(box.position);
-        if (dist < 2.35) {
-          this.collectTagBox(box);
-        }
-      }
-    });
-
-    // Sync mesh position & rotation
-    this.playerMesh.position.copy(this.player.pos);
-    this.playerMesh.rotation.y = this.player.rotY;
-
-    // Project My Nameplate & Score
-    this.metaverse.projectLabel(
-      this.player.pos,
-      this.myLabelEl,
-      `${this.player.name} (나)`,
-      this.player.score,
-      this.player.chatBubble,
-      true
-    );
-
-    // Smooth 3rd-Person Camera Follow
-    const targetCamX =
-      this.player.pos.x + Math.sin(this.camYaw) * Math.cos(this.camPitch) * this.camDist;
-    const targetCamY =
-      this.player.pos.y + Math.sin(this.camPitch) * this.camDist + 2.2;
-    const targetCamZ =
-      this.player.pos.z + Math.cos(this.camYaw) * Math.cos(this.camPitch) * this.camDist;
-
-    this.world.camera.position.lerp(new THREE.Vector3(targetCamX, targetCamY, targetCamZ), 0.12);
-    this.world.camera.lookAt(
-      this.player.pos.x,
-      this.player.pos.y + 1.8,
-      this.player.pos.z
-    );
+  showToast(msg) {
+    const banner = document.getElementById('toast-banner');
+    if (!banner) return;
+    banner.textContent = msg;
+    banner.classList.add('show');
+    clearTimeout(this.toastTimer);
+    this.toastTimer = setTimeout(() => banner.classList.remove('show'), 2900);
   }
 
   animate() {
@@ -975,15 +1106,9 @@ class KidsCafeApp {
     this.lastTime = now;
     const elapsed = now / 1000;
 
-    this.updatePlayer(dt, elapsed);
-    this.world.updateWorldElements(dt, elapsed, this.player.pos);
-    this.metaverse.update(dt, elapsed, this.player);
-
-    this.syncTimer += dt;
-    if (this.syncTimer > 0.15) {
-      this.syncTimer = 0;
-      this.metaverse.broadcastMyState(this.player);
-    }
+    const positions = this.updateAvatarsAndRides(dt, now, elapsed);
+    this.world.updateWorldElements(dt, elapsed, positions);
+    this.updateCamera();
 
     this.world.renderer.render(this.world.scene, this.world.camera);
   }
